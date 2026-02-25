@@ -1,0 +1,49 @@
+[project]
+name = "lauterbachdebugger-mcp"
+version = "0.1.0"
+description = "MCP server for controlling a Lauterbach TRACE32 debugger via pyrcl"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Hossam" }]
+keywords = ["lauterbach", "trace32", "mcp", "debugger", "embedded"]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Debuggers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "click>=8.1.7",
+    "mcp>=1.0.0",
+    "lauterbach-trace32-rcl>=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hsoffar/lauterbach-trace32-mcp"
+Repository = "https://github.com/hsoffar/lauterbach-trace32-mcp"
+"Bug Tracker" = "https://github.com/hsoffar/lauterbach-trace32-mcp/issues"
+
+[project.scripts]
+lauterbachdebugger-mcp = "lauterbachdebugger_mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pyright>=1.1.0", "ruff>=0.7.0", "pytest>=8.0.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lauterbachdebugger_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
