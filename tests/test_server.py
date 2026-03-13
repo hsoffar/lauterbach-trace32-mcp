@@ -40,8 +40,14 @@ from lauterbachdebugger_mcp.server import (
 def reset_connection():
     """Guarantee a clean (disconnected) state around every test."""
     srv._dbg = None
+    srv._auto_connect_task = None
+    srv._conn_defaults.update(host="localhost", port=20000,
+                              protocol="TCP", timeout=60.0)
     yield
     srv._dbg = None
+    srv._auto_connect_task = None
+    srv._conn_defaults.update(host="localhost", port=20000,
+                              protocol="TCP", timeout=60.0)
 
 
 @pytest.fixture()
@@ -209,6 +215,9 @@ class TestConnectionTools:
         assert srv._dbg is mock_conn
 
     def test_connect_uses_defaults_when_no_args(self):
+        # Reset to known defaults
+        srv._conn_defaults.update(host="localhost", port=20000,
+                                  protocol="TCP", timeout=60.0)
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
             mock_t32.connect.return_value = MagicMock()
             run(call_tool("connect", {}))
@@ -556,7 +565,8 @@ async def _mock_stdio():
 
 
 class TestServe:
-    def _run_serve(self, host="localhost", port=20000, protocol="TCP", timeout=60.0):
+    def _run_serve(self, host="localhost", port=20000, protocol="TCP",
+                   timeout=60.0):
         async def _inner():
             with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
                  patch("lauterbachdebugger_mcp.server.server") as mock_srv:
@@ -565,43 +575,80 @@ class TestServe:
                 await serve(host, port, protocol, timeout)
         asyncio.run(_inner())
 
-    def test_auto_connect_calls_t32_with_correct_args(self):
-        mock_conn = MagicMock()
-        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
-            mock_t32.connect.return_value = mock_conn
+    def test_auto_connect_task_is_created(self):
+        """serve() creates a background auto-connect task."""
+        with patch("lauterbachdebugger_mcp.server.t32"):
             self._run_serve("192.168.0.1", 9000, "UDP", 5.0)
-        mock_t32.connect.assert_called_once_with(
-            node="192.168.0.1", port="9000", protocol="UDP", timeout=5.0
-        )
+        # The task was created (may be done or cancelled by now)
+        assert srv._auto_connect_task is not None
 
-    def test_auto_connect_sets_dbg(self):
+    def test_auto_connect_success_sets_dbg(self):
+        """Successful auto-connect sets the global debugger handle."""
         mock_conn = MagicMock()
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
             mock_t32.connect.return_value = mock_conn
+            # Run _try_auto_connect directly to test the logic
+            asyncio.run(srv._try_auto_connect(
+                "localhost", 20000, "TCP", 60.0))
+        assert srv._dbg is mock_conn
 
-            async def _check():
-                with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
-                     patch("lauterbachdebugger_mcp.server.server") as mock_srv:
-                    mock_srv.run = AsyncMock()
-                    mock_srv.create_initialization_options.return_value = {}
-                    await serve("localhost", 20000, "TCP", 60.0)
-                assert srv._dbg is mock_conn
-
-            asyncio.run(_check())
-
-    def test_failed_auto_connect_does_not_abort_server(self):
-        """ConnectionRefusedError on connect must not prevent the server from starting."""
+    def test_auto_connect_failure_does_not_abort_server(self):
+        """Failed auto-connect logs warning; server keeps running."""
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
-            mock_t32.connect.side_effect = ConnectionRefusedError("no TRACE32")
+            mock_t32.connect.side_effect = ConnectionRefusedError("no T32")
             self._run_serve()  # must not raise
         assert srv._dbg is None
 
+    def test_auto_connect_skips_if_already_connected(self):
+        """If user connected via tool before auto-connect finishes, discard."""
+        existing = MagicMock()
+        srv._dbg = existing
+        new_conn = MagicMock()
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = new_conn
+            asyncio.run(srv._try_auto_connect(
+                "localhost", 20000, "TCP", 60.0))
+        # Existing connection preserved, new one disconnected
+        assert srv._dbg is existing
+        new_conn.disconnect.assert_called_once()
+
+    def test_stores_connection_defaults(self):
+        """serve() must store CLI params so the connect tool can use them."""
+        self._run_serve("10.0.0.1", 9999, "UDP", 5.0)
+        assert srv._conn_defaults["host"] == "10.0.0.1"
+        assert srv._conn_defaults["port"] == 9999
+        assert srv._conn_defaults["protocol"] == "UDP"
+        assert srv._conn_defaults["timeout"] == 5.0
+
     def test_stdio_server_run_is_called(self):
-        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32, \
-             patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+        with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
              patch("lauterbachdebugger_mcp.server.server") as mock_srv:
-            mock_t32.connect.return_value = MagicMock()
             mock_srv.run = AsyncMock()
             mock_srv.create_initialization_options.return_value = {}
             asyncio.run(serve("localhost", 20000, "TCP", 60.0))
         mock_srv.run.assert_awaited_once()
+
+    def test_connect_tool_uses_stored_defaults(self):
+        """When connect tool is called with no args, it uses serve() defaults."""
+        srv._conn_defaults.update(host="10.0.0.1", port=9999,
+                                  protocol="UDP", timeout=5.0)
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = MagicMock()
+            run(call_tool("connect", {}))
+        mock_t32.connect.assert_called_once_with(
+            node="10.0.0.1", port="9999", protocol="UDP", timeout=5.0
+        )
+
+    def test_connect_tool_cancels_pending_auto_connect(self):
+        """Explicit connect cancels a pending auto-connect task."""
+        # Simulate a pending (not yet done) auto-connect task
+        pending_task = AsyncMock(spec=asyncio.Task)
+        pending_task.done.return_value = False
+        pending_task.cancel.return_value = True
+        srv._auto_connect_task = pending_task
+
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = MagicMock()
+            run(call_tool("connect", {}))
+
+        pending_task.cancel.assert_called_once()

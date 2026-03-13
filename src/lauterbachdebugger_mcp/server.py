@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Any, Optional
@@ -14,6 +15,17 @@ logger = logging.getLogger(__name__)
 # Global debugger connection (one per server process)
 # ---------------------------------------------------------------------------
 _dbg: Optional[t32.Debugger] = None
+
+# Connection defaults (set by serve(), used by connect tool as fallbacks)
+_conn_defaults: dict[str, Any] = {
+    "host": "localhost",
+    "port": 20000,
+    "protocol": "TCP",
+    "timeout": 60.0,
+}
+
+# Background auto-connect task (if running)
+_auto_connect_task: Optional[asyncio.Task] = None
 
 server = Server("lauterbachdebugger-mcp")
 
@@ -524,14 +536,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     try:
         # ── Connection ────────────────────────────────────────────────────
         if name == "connect":
+            # Cancel pending auto-connect if still running
+            if _auto_connect_task and not _auto_connect_task.done():
+                _auto_connect_task.cancel()
+                try:
+                    await _auto_connect_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if _dbg is not None:
                 _dbg.disconnect()
                 _dbg = None
             _dbg = t32.connect(
-                node=arguments.get("node", "localhost"),
-                port=str(arguments.get("port", 20000)),
-                protocol=arguments.get("protocol", "TCP"),
-                timeout=float(arguments.get("timeout", 60.0)),
+                node=arguments.get("node", _conn_defaults["host"]),
+                port=str(arguments.get("port", _conn_defaults["port"])),
+                protocol=arguments.get("protocol", _conn_defaults["protocol"]),
+                timeout=float(arguments.get("timeout", _conn_defaults["timeout"])),
             )
             return _ok("Connected to TRACE32 debugger.")
 
@@ -783,21 +802,61 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 # ---------------------------------------------------------------------------
 # Serve
 # ---------------------------------------------------------------------------
-async def serve(host: str, port: int, protocol: str, timeout: float) -> None:
+async def _try_auto_connect(host: str, port: int, protocol: str,
+                            timeout: float) -> None:
+    """Background auto-connect attempt.  Sets _dbg on success."""
     global _dbg
-
     try:
-        _dbg = t32.connect(node=host, port=str(port), protocol=protocol, timeout=timeout)
-        logger.info("Connected to TRACE32 at %s:%s", host, port)
+        conn = await asyncio.to_thread(
+            t32.connect, node=host, port=str(port), protocol=protocol,
+            timeout=timeout,
+        )
+        # Only set if no explicit connect happened while we were waiting
+        if _dbg is None:
+            _dbg = conn
+            logger.info("Auto-connected to TRACE32 at %s:%s", host, port)
+        else:
+            # User already connected via 'connect' tool; discard ours
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.warning(
-            "Auto-connect to TRACE32 at %s:%s failed (%s) — call the 'connect' tool manually.",
+            "Auto-connect to TRACE32 at %s:%s failed (%s) "
+            "-- call the 'connect' tool manually.",
             host, port, exc,
         )
 
+
+async def serve(host: str, port: int, protocol: str, timeout: float) -> None:
+    global _auto_connect_task
+
+    # Store connection parameters so the connect tool can use them as defaults
+    _conn_defaults.update(host=host, port=port, protocol=protocol, timeout=timeout)
+
+    logger.info(
+        "MCP server starting (auto-connecting to TRACE32 at %s:%s)",
+        host, port,
+    )
+
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
+        _auto_connect_task = asyncio.create_task(
+            _try_auto_connect(host, port, protocol, timeout)
         )
+        try:
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+        finally:
+            # Clean up the background task on shutdown
+            if _auto_connect_task and not _auto_connect_task.done():
+                _auto_connect_task.cancel()
+                try:
+                    await _auto_connect_task
+                except (asyncio.CancelledError, Exception):
+                    pass

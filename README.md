@@ -26,7 +26,9 @@ PRACTICE scripts, and more.
 | Symbols | `query_symbol_by_name`, `query_symbol_by_address` |
 | PRACTICE Macros | `get_practice_macro`, `set_practice_macro` |
 
-**Auto-connect on startup** via environment variables — no need to call `connect` manually.
+**Non-blocking Auto-connect startup** — the server registers with the MCP client immediately
+and auto-connects to TRACE32 in the background. If TRACE32 is not running,
+the server stays available and you can connect later via the `connect` tool.
 
 ---
 
@@ -190,7 +192,9 @@ asyncio.run(main())
 ### Connection
 
 #### `connect`
-Connect to a TRACE32 debugger manually (use when auto-connect is not configured).
+Connect to a TRACE32 debugger. If a background auto-connect is still
+pending or has failed, cancels it and reconnects. Uses CLI defaults
+when parameters are omitted.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
