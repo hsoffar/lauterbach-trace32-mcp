@@ -76,7 +76,16 @@ Load symbols with: run_command("Data.LOAD.ELF <file>") or via a CMM script.
 4. go - resume execution
 
 ### After Any Step/Break
-Call `get_context` for a quick situational snapshot (PC, function, source).
+Execution control tools (step, break_, step_over, etc.) automatically
+return PC and, when debug symbols are loaded, function name, source
+file, and source line.  No separate call is needed for basic
+situational awareness.  Use `get_context` only when you need the
+full snapshot (SP, LR, CPU name, etc.).
+
+### Enriched Responses
+- Breakpoint tools include symbol resolution (function, source location)
+  at the breakpoint address.
+- `read_memory` includes an `ascii` field alongside hex and bytes.
 
 ### Set Breakpoint by Name
 Use `set_breakpoint_at_symbol` with a function name like "main".
@@ -736,35 +745,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         # ── Execution control ─────────────────────────────────────────────
         elif name == "go":
             _require_connection().go()
-            return _ok("Execution started (Go).")
+            return _ok({"action": "go", "status": "running"})
 
         elif name == "break_":
-            _require_connection().break_()
-            return _ok("Execution halted (Break).")
+            dbg = _require_connection()
+            dbg.break_()
+            result: dict[str, Any] = {"action": "break", "status": "halted"}
+            result.update(_get_brief_context(dbg))
+            return _ok(result)
 
-        elif name == "step":
-            _require_connection().step()
-            return _ok("Single step executed.")
-
-        elif name == "step_asm":
-            _require_connection().step_asm()
-            return _ok("Assembly step executed.")
-
-        elif name == "step_hll":
-            _require_connection().step_hll()
-            return _ok("HLL (source-level) step executed.")
-
-        elif name == "step_over":
-            _require_connection().step_over()
-            return _ok("Step.Over executed.")
-
-        elif name == "go_up":
-            _require_connection().go_up()
-            return _ok("Go.Up executed — running to function return.")
-
-        elif name == "go_return":
-            _require_connection().go_return()
-            return _ok("Go.Return executed.")
+        elif name in ("step", "step_asm", "step_hll", "step_over",
+                       "go_up", "go_return"):
+            dbg = _require_connection()
+            getattr(dbg, name)()
+            result = {"action": name, "status": "completed"}
+            result.update(_get_brief_context(dbg))
+            return _ok(result)
 
         # ── Commands & Functions ──────────────────────────────────────────
         elif name == "run_command":
@@ -790,11 +786,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             dbg = _require_connection()
             addr = dbg.address.from_string(arguments["address"])
             data = dbg.memory.read(addr, length=int(arguments["length"]))
+            ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
             return _ok({
                 "address": arguments["address"],
                 "length": len(data),
                 "hex": data.hex(),
                 "bytes": list(data),
+                "ascii": ascii_repr,
             })
 
         elif name == "read_memory_typed":
@@ -879,11 +877,29 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 core=arguments.get("core"),
                 enabled=arguments.get("enabled", True),
             )
-            return _ok(str(bp))
+            bp_info: dict[str, Any] = {
+                "breakpoint": str(bp),
+                "address": arguments["address"],
+                "type": arguments.get("type", "PROGRAM"),
+                "impl": arguments.get("impl", "AUTO"),
+            }
+            bp_info.update(_resolve_symbol_at(dbg, arguments["address"]))
+            return _ok(bp_info)
 
         elif name == "list_breakpoints":
-            bps = _require_connection().breakpoint.list()
-            return _ok([str(bp) for bp in bps])
+            dbg = _require_connection()
+            bps = dbg.breakpoint.list()
+            bp_list = []
+            for bp in bps:
+                entry: dict[str, Any] = {"breakpoint": str(bp)}
+                try:
+                    addr_str = str(bp.address) if hasattr(bp, "address") and bp.address else None
+                    if addr_str:
+                        entry.update(_resolve_symbol_at(dbg, addr_str))
+                except Exception:
+                    pass
+                bp_list.append(entry)
+            return _ok(bp_list)
 
         elif name == "delete_breakpoint":
             dbg = _require_connection()

@@ -234,6 +234,11 @@ class TestServerInstructions:
         assert "D:0x" in srv.INSTRUCTIONS
         assert "P:0x" in srv.INSTRUCTIONS
 
+    def test_instructions_mention_enriched_responses(self):
+        assert "Enriched Responses" in srv.INSTRUCTIONS
+        assert "ascii" in srv.INSTRUCTIONS
+        assert "symbol resolution" in srv.INSTRUCTIONS
+
     def test_load_hints_from_file(self, tmp_path):
         f = tmp_path / "tips.md"
         f.write_text("# My Tips\nuse breakpoints\n", encoding="utf-8")
@@ -497,20 +502,76 @@ class TestConnectionTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestExecutionTools:
-    @pytest.mark.parametrize("tool,method,fragment", [
-        ("go",        "go",        "Go"),
-        ("break_",    "break_",    "Break"),
-        ("step",      "step",      "step"),
-        ("step_asm",  "step_asm",  "Assembly"),
-        ("step_hll",  "step_hll",  "HLL"),
-        ("step_over", "step_over", "Step.Over"),
-        ("go_up",     "go_up",     "Go.Up"),
-        ("go_return", "go_return", "Go.Return"),
+    def test_go_returns_running_status(self, mock_dbg):
+        result = run(call_tool("go", {}))
+        mock_dbg.go.assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == "go"
+        assert data["status"] == "running"
+
+    def test_break_returns_context_with_symbols(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }.get(expr, "")
+        result = run(call_tool("break_", {}))
+        mock_dbg.break_.assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == "break"
+        assert data["status"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["function"] == "main"
+
+    def test_break_returns_context_without_symbols(self, mock_dbg):
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x1000"
+            raise RuntimeError("no symbols loaded")
+        mock_dbg.fnc.side_effect = _side_effect
+        result = run(call_tool("break_", {}))
+        data = json.loads(result[0].text)
+        assert data["action"] == "break"
+        assert data["status"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["function"] is None
+        assert data["source_file"] is None
+        assert data["source_line"] is None
+
+    @pytest.mark.parametrize("tool", [
+        "step", "step_asm", "step_hll", "step_over", "go_up", "go_return",
     ])
-    def test_execution_tool(self, tool, method, fragment, mock_dbg):
+    def test_step_tools_return_context_with_symbols(self, tool, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x2000",
+            "sYmbol.FUNCTION(D:0x2000)": "handler",
+            "sYmbol.SOURCEFILE(D:0x2000)": "irq.c",
+            "sYmbol.SOURCELINE(D:0x2000)": "10",
+        }.get(expr, "")
         result = run(call_tool(tool, {}))
-        getattr(mock_dbg, method).assert_called_once()
-        assert fragment in result[0].text
+        getattr(mock_dbg, tool).assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == tool
+        assert data["status"] == "completed"
+        assert data["pc"] == "0x2000"
+        assert data["function"] == "handler"
+
+    @pytest.mark.parametrize("tool", [
+        "step", "step_asm", "step_hll", "step_over", "go_up", "go_return",
+    ])
+    def test_step_tools_return_context_without_symbols(self, tool, mock_dbg):
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x2000"
+            raise RuntimeError("no symbols loaded")
+        mock_dbg.fnc.side_effect = _side_effect
+        result = run(call_tool(tool, {}))
+        data = json.loads(result[0].text)
+        assert data["action"] == tool
+        assert data["status"] == "completed"
+        assert data["pc"] == "0x2000"
+        assert data["function"] is None
 
     def test_not_connected_returns_error_not_raises(self):
         result = run(call_tool("go", {}))
@@ -547,12 +608,13 @@ class TestPracticeTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMemoryTools:
-    def test_read_memory_returns_hex_and_bytes(self, mock_dbg):
-        mock_dbg.memory.read.return_value = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    def test_read_memory_returns_hex_bytes_and_ascii(self, mock_dbg):
+        mock_dbg.memory.read.return_value = bytes([0xDE, 0xAD, 0x42, 0xEF])
         data = json.loads(run(call_tool("read_memory", {"address": "0x20000000", "length": 4}))[0].text)
-        assert data["hex"] == "deadbeef"
+        assert data["hex"] == "dead42ef"
         assert data["length"] == 4
-        assert data["bytes"] == [0xDE, 0xAD, 0xBE, 0xEF]
+        assert data["bytes"] == [0xDE, 0xAD, 0x42, 0xEF]
+        assert data["ascii"] == "..B."  # 0xDE, 0xAD non-printable; 0x42='B'; 0xEF non-printable
 
     @pytest.mark.parametrize("dtype,method", [
         ("uint8",  "read_uint8"),
@@ -639,18 +701,28 @@ class TestRegisterTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestBreakpointTools:
-    def test_set_breakpoint_default_type_and_impl(self, mock_dbg):
+    def test_set_breakpoint_returns_enriched_info(self, mock_dbg):
         mock_dbg.breakpoint.set.return_value = MagicMock(__str__=lambda s: "BP@0x1000")
+        mock_dbg.fnc.return_value = "main"
         result = run(call_tool("set_breakpoint", {"address": "0x08000100"}))
         assert mock_dbg.breakpoint.set.called
-        assert "BP@0x1000" in result[0].text
+        data = json.loads(result[0].text)
+        assert data["breakpoint"] == "BP@0x1000"
+        assert data["address"] == "0x08000100"
+        assert data["type"] == "PROGRAM"
+        assert data["impl"] == "AUTO"
 
-    def test_list_breakpoints_returns_all(self, mock_dbg):
-        mock_dbg.breakpoint.list.return_value = [
-            MagicMock(__str__=lambda s: f"BP{i}") for i in range(3)
-        ]
+    def test_list_breakpoints_returns_enriched_list(self, mock_dbg):
+        bp_mocks = []
+        for i in range(3):
+            bp = MagicMock(__str__=lambda s, n=i: f"BP{n}")
+            bp.address = MagicMock(__str__=lambda s, n=i: f"0x{n}000")
+            bp_mocks.append(bp)
+        mock_dbg.breakpoint.list.return_value = bp_mocks
+        mock_dbg.fnc.return_value = None
         data = json.loads(run(call_tool("list_breakpoints", {}))[0].text)
         assert len(data) == 3
+        assert "breakpoint" in data[0]
 
     def test_delete_breakpoint(self, mock_dbg):
         mock_bp = MagicMock()

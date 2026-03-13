@@ -241,6 +241,9 @@ Returns the last message shown in the TRACE32 message line as `{ text, type }`.
 
 ### Execution Control
 
+All execution control tools return enriched responses with PC, function name,
+source file, and source line after the operation completes.
+
 | Tool | Description |
 |---|---|
 | `go` | Start / resume execution |
@@ -287,7 +290,7 @@ Run a CMM script file (blocking).
 ### Memory
 
 #### `read_memory`
-Read raw bytes. Returns `{ address, length, hex, bytes[] }`.
+Read raw bytes. Returns `{ address, length, hex, bytes[], ascii }`.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -339,8 +342,10 @@ Write a value to a register.
 | `core` | integer | — | Core (optional) |
 | `enabled` | boolean | `true` | Whether enabled |
 
+Returns enriched response with symbol resolution at the breakpoint address.
+
 #### `list_breakpoints`
-Returns a list of all currently set breakpoints.
+Returns a list of all currently set breakpoints with symbol info.
 
 #### `delete_breakpoint`
 Delete the breakpoint at the given `address`.
