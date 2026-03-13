@@ -604,8 +604,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return _ok({"function": arguments["function"], "result": result})
 
         elif name == "run_practice_script":
-            timeout = arguments.get("timeout")
-            _require_connection().cmm(arguments["script_path"], timeout=timeout)
+            script_timeout = arguments.get("timeout")
+            if script_timeout is not None:
+                script_timeout = float(script_timeout)
+            _require_connection().cmm(
+                arguments["script_path"],
+                timeout=script_timeout,  # type: ignore[arg-type]  # pyrcl accepts None
+            )
             return _ok(f"Script completed: {arguments['script_path']}")
 
         # ── Memory ────────────────────────────────────────────────────────
