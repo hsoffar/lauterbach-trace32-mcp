@@ -43,11 +43,13 @@ def reset_connection():
     srv._auto_connect_task = None
     srv._conn_defaults.update(host="localhost", port=20000,
                               protocol="TCP", timeout=60.0)
+    srv._config.update(t32_dir="~/t32")
     yield
     srv._dbg = None
     srv._auto_connect_task = None
     srv._conn_defaults.update(host="localhost", port=20000,
                               protocol="TCP", timeout=60.0)
+    srv._config.update(t32_dir="~/t32")
 
 
 @pytest.fixture()
@@ -121,7 +123,8 @@ class TestCLI:
 
     def test_help_lists_all_options(self):
         output = self.runner.invoke(main, ["--help"]).output
-        for opt in ("--host", "--port", "--protocol", "--timeout", "--verbose"):
+        for opt in ("--host", "--port", "--protocol", "--timeout", "--verbose",
+                     "--t32-dir"):
             assert opt in output
 
     def test_invalid_protocol_rejected(self):
@@ -131,25 +134,45 @@ class TestCLI:
     def test_default_values_forwarded_to_serve(self):
         received = {}
 
-        async def fake_serve(host, port, protocol, timeout):
-            received.update(host=host, port=port, protocol=protocol, timeout=timeout)
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(host=host, port=port, protocol=protocol,
+                            timeout=timeout, **kwargs)
 
+        # Clear env vars so Click uses coded defaults, not the shell environment
         with patch("lauterbachdebugger_mcp.serve", fake_serve):
-            self.runner.invoke(main, [])
+            self.runner.invoke(main, [], env={
+                "T32_HOST": "",
+                "T32_PORT": "",
+                "T32_PROTOCOL": "",
+                "T32_TIMEOUT": "",
+                "T32SYS": "",
+            })
 
         assert received == {"host": "localhost", "port": 20000,
-                            "protocol": "TCP", "timeout": 60.0}
+                            "protocol": "TCP", "timeout": 60.0,
+                            "t32_dir": "~/t32"}
 
     def test_custom_host_and_port_forwarded(self):
         received = {}
 
-        async def fake_serve(host, port, protocol, timeout):
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
             received.update(host=host, port=port)
 
         with patch("lauterbachdebugger_mcp.serve", fake_serve):
             self.runner.invoke(main, ["--host", "192.168.1.1", "--port", "9999"])
 
         assert received == {"host": "192.168.1.1", "port": 9999}
+
+    def test_t32_dir_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--t32-dir", "/custom/t32"])
+
+        assert received["t32_dir"] == "/custom/t32"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,6 +650,22 @@ class TestServe:
             mock_srv.create_initialization_options.return_value = {}
             asyncio.run(serve("localhost", 20000, "TCP", 60.0))
         mock_srv.run.assert_awaited_once()
+
+    def test_stores_t32_dir_config(self):
+        """serve() must store t32_dir in _config."""
+        self._run_serve()
+        assert srv._config["t32_dir"] == "~/t32"
+
+    def test_stores_custom_t32_dir_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             t32_dir="/custom/t32")
+        asyncio.run(_inner())
+        assert srv._config["t32_dir"] == "/custom/t32"
 
     def test_connect_tool_uses_stored_defaults(self):
         """When connect tool is called with no args, it uses serve() defaults."""

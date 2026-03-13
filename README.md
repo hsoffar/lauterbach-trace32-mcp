@@ -90,6 +90,9 @@ lauterbachdebugger-mcp
 # Custom host/port
 lauterbachdebugger-mcp --host 192.168.1.100 --port 20000
 
+# With TRACE32 installation path
+lauterbachdebugger-mcp --t32-dir ~/t32
+
 # Verbose logging
 lauterbachdebugger-mcp -v
 
@@ -105,6 +108,7 @@ python -m lauterbachdebugger_mcp
 | `--port` | `-p` | `T32_PORT` | `20000` | Remote API port |
 | `--protocol` | | `T32_PROTOCOL` | `TCP` | `TCP` or `UDP` |
 | `--timeout` | | `T32_TIMEOUT` | `60.0` | Connection timeout (seconds) |
+| `--t32-dir` | | `T32SYS` | `~/t32` | TRACE32 installation directory (`C:\T32\` on Windows) |
 | `--verbose` | `-v` | | off | Repeat for more detail (`-vv`) |
 
 ---
@@ -117,6 +121,7 @@ python -m lauterbachdebugger_mcp
 claude mcp add --transport stdio lauterbach-trace32 \
   --env T32_HOST=localhost \
   --env T32_PORT=20000 \
+  --env T32SYS=~/t32 \
   -- lauterbachdebugger-mcp
 ```
 
@@ -142,7 +147,8 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
       "env": {
         "T32_HOST": "localhost",
         "T32_PORT": "20000",
-        "T32_PROTOCOL": "TCP"
+        "T32_PROTOCOL": "TCP",
+        "T32SYS": "~/t32"
       }
     }
   }
@@ -161,7 +167,8 @@ Add to `.vscode/mcp.json` in your workspace (or user settings):
       "command": "lauterbachdebugger-mcp",
       "env": {
         "T32_HOST": "localhost",
-        "T32_PORT": "20000"
+        "T32_PORT": "20000",
+        "T32SYS": "~/t32"
       }
     }
   }

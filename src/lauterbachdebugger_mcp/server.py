@@ -27,6 +27,11 @@ _conn_defaults: dict[str, Any] = {
 # Background auto-connect task (if running)
 _auto_connect_task: Optional[asyncio.Task] = None
 
+# Server configuration (set by serve())
+_config: dict[str, Any] = {
+    "t32_dir": "~/t32",
+}
+
 server = Server("lauterbachdebugger-mcp")
 
 
@@ -831,11 +836,21 @@ async def _try_auto_connect(host: str, port: int, protocol: str,
         )
 
 
-async def serve(host: str, port: int, protocol: str, timeout: float) -> None:
+async def serve(
+    host: str,
+    port: int,
+    protocol: str,
+    timeout: float,
+    *,
+    t32_dir: str = "~/t32",
+) -> None:
     global _auto_connect_task
 
     # Store connection parameters so the connect tool can use them as defaults
     _conn_defaults.update(host=host, port=port, protocol=protocol, timeout=timeout)
+
+    # Store configuration paths
+    _config.update(t32_dir=t32_dir)
 
     logger.info(
         "MCP server starting (auto-connecting to TRACE32 at %s:%s)",
