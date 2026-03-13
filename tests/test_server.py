@@ -156,11 +156,13 @@ class TestCLI:
                 "T32_TIMEOUT": "",
                 "T32SYS": "",
                 "T32_HINTS": "",
+                "T32_CACHE_DIR": "",
             })
 
         assert received == {"host": "localhost", "port": 20000,
                             "protocol": "TCP", "timeout": 60.0,
-                            "t32_dir": "~/t32", "hints": None}
+                            "t32_dir": "~/t32", "hints": None,
+                            "pdf_cache_dir": "~/.cache/lauterbach-t32-mcp"}
 
     def test_custom_host_and_port_forwarded(self):
         received = {}
@@ -1454,6 +1456,182 @@ class TestSearchTraceDocs:
         srv._config["t32_dir"] = str(tmp_path)
         result = _j(run(call_tool("search_trace32_docs", {"query": "zzzzz"})))
         assert result["total"] == 0
+
+    def test_scan_pdf_docs_has_pdf_path(self, tmp_path):
+        """_scan_pdf_docs returns pdf_path (not path) in each entry."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        doc = result["docs"][0]
+        assert "pdf_path" in doc
+        assert doc["pdf_path"].endswith("debugger_arm.pdf")
+        assert "path" not in doc  # old key removed
+
+    def test_search_uses_cached_txt(self, tmp_path):
+        """search_trace32_docs returns snippets from cached .txt files."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        pdf_file = pdf_dir / "practice_ref.pdf"
+        pdf_file.write_bytes(b"fake pdf content")
+        # Pre-populate a fake cache entry in a temp dir.
+        cache_dir = tmp_path / "pdf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        srv._config["pdf_cache_dir"] = str(cache_dir)
+        txt_file = cache_dir / "practice_ref.txt"
+        txt_file.write_text(
+            "Line before\nsYmbol.LIST.FUNCTION filter example\nLine after\n"
+        )
+        md5_file = cache_dir / "practice_ref.md5"
+        import hashlib
+        h = hashlib.md5(b"fake pdf content").hexdigest()
+        md5_file.write_text(h + "\n")
+        # Mark as verified so the test doesn't re-hash.
+        pdf_key = str(pdf_file.resolve())
+        srv._pdf_cache_verified.add(pdf_key)
+        srv._config["t32_dir"] = str(tmp_path)
+        try:
+            result = _j(run(call_tool("search_trace32_docs",
+                                      {"query": "sYmbol.LIST"})))
+            assert result["total"] == 1
+            doc = result["results"][0]
+            assert "snippets" in doc
+            assert any("sYmbol.LIST.FUNCTION" in s for s in doc["snippets"])
+            assert doc["txt_path"] is not None
+            assert doc["pdf_path"].endswith("practice_ref.pdf")
+        finally:
+            srv._pdf_cache_verified.discard(pdf_key)
+            srv._config["pdf_cache_dir"] = "~/.cache/lauterbach-t32-mcp"
+
+    def test_search_extracts_uncached_pdf(self, tmp_path):
+        """search_trace32_docs extracts PDFs on demand when not yet cached."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        pdf_file = pdf_dir / "practice_ref.pdf"
+        pdf_file.write_bytes(b"fake pdf content")
+        cache_dir = tmp_path / "pdf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        srv._config["t32_dir"] = str(tmp_path)
+        srv._config["pdf_cache_dir"] = str(cache_dir)
+        fake_text = "Line before\nsYmbol.LIST.FUNCTION filter example\nLine after\n"
+        try:
+            with patch.object(
+                srv, "_get_or_cache_pdf_text", return_value=fake_text
+            ):
+                result = _j(run(call_tool("search_trace32_docs",
+                                          {"query": "sYmbol.LIST"})))
+            assert result["total"] == 1
+            doc = result["results"][0]
+            assert "snippets" in doc
+            assert any("sYmbol.LIST.FUNCTION" in s for s in doc["snippets"])
+        finally:
+            srv._config["pdf_cache_dir"] = "~/.cache/lauterbach-t32-mcp"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF text cache helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPdfCache:
+    def test_pdf_md5_consistent(self, tmp_path):
+        """_pdf_md5 returns the same hex digest for identical content."""
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"hello world")
+        d1 = srv._pdf_md5(f)
+        d2 = srv._pdf_md5(f)
+        assert d1 == d2
+        assert len(d1) == 32
+
+    def test_pdf_md5_differs_on_change(self, tmp_path):
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"version1")
+        d1 = srv._pdf_md5(f)
+        f.write_bytes(b"version2")
+        d2 = srv._pdf_md5(f)
+        assert d1 != d2
+
+    def test_get_pdf_cache_dir_no_pdftotext(self, tmp_path):
+        """Returns None when pdftotext is not available."""
+        with patch("shutil.which", return_value=None):
+            result = srv._get_pdf_cache_dir()
+        assert result is None
+
+    def test_get_pdf_cache_dir_creates_dir(self, tmp_path, monkeypatch):
+        """Returns the cache directory and creates it on first call."""
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(tmp_path / "pdf-cache"))
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+            result = srv._get_pdf_cache_dir()
+        assert result is not None
+        assert result.is_dir()
+
+    def test_cache_miss_no_pdftotext(self, tmp_path):
+        """Returns None when pdftotext is absent."""
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"content")
+        with patch("shutil.which", return_value=None):
+            result = srv._get_or_cache_pdf_text(pdf)
+        assert result is None
+
+    def test_cache_hit_session_verified(self, tmp_path, monkeypatch):
+        """Fast path: returns cached text without re-hashing when already
+        verified in this session."""
+        import hashlib
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(cache_dir))
+
+        pdf = tmp_path / "doc.pdf"
+        content = b"pdf bytes"
+        pdf.write_bytes(content)
+
+        txt = cache_dir / "doc.txt"
+        txt.write_text("extracted text")
+        (cache_dir / "doc.md5").write_text(
+            hashlib.md5(content).hexdigest() + "\n"
+        )
+        pdf_key = str(pdf.resolve())
+        srv._pdf_cache_verified.add(pdf_key)
+        try:
+            with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+                result = srv._get_or_cache_pdf_text(pdf)
+            assert result == "extracted text"
+        finally:
+            srv._pdf_cache_verified.discard(pdf_key)
+
+    def test_cache_regenerated_on_md5_change(self, tmp_path, monkeypatch):
+        """Cache is regenerated when the PDF changes (MD5 mismatch)."""
+        import hashlib
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(cache_dir))
+
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"new content")
+        txt = cache_dir / "doc.txt"
+        (cache_dir / "doc.md5").write_text(
+            hashlib.md5(b"old content").hexdigest() + "\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            # Simulate pdftotext writing the .tmp output file.
+            out = cmd[2]  # third arg is the output path
+            from pathlib import Path
+            Path(out).write_text("fresh text")
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        pdf_key = str(pdf.resolve())
+        srv._pdf_cache_verified.discard(pdf_key)
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"), \
+                patch("subprocess.run", side_effect=fake_run):
+            result = srv._get_or_cache_pdf_text(pdf)
+
+        assert result == "fresh text"
+        assert txt.is_file()
+        assert (cache_dir / "doc.md5").read_text().strip() == \
+            hashlib.md5(b"new content").hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

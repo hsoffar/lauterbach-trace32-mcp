@@ -124,6 +124,7 @@ python -m lauterbachdebugger_mcp
 | `--timeout` | | `T32_TIMEOUT` | `60.0` | Connection timeout (seconds) |
 | `--t32-dir` | | `T32SYS` | `~/t32` | TRACE32 installation directory (`C:\T32\` on Windows) |
 | `--hints` | | `T32_HINTS` | | Hints file or directory (see [AGENTS.md](https://agents.md/) convention) |
+| `--cache-dir` | | `T32_CACHE_DIR` | `~/.cache/lauterbach-t32-mcp` | PDF-to-text cache directory |
 | `--verbose` | `-v` | | off | Repeat for more detail (`-vv`) |
 
 ---

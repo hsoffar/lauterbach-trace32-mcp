@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -45,6 +48,7 @@ _auto_connect_task: Optional[asyncio.Task] = None
 _config: dict[str, Any] = {
     "t32_dir": "~/t32",
     "hints": None,
+    "pdf_cache_dir": "~/.cache/lauterbach-t32-mcp",
 }
 
 # ---------------------------------------------------------------------------
@@ -1189,13 +1193,190 @@ def _scan_pdf_docs(category: Optional[str] = None) -> list[dict[str, Any]]:
         cat = name.split("_")[0] if "_" in name else "other"
         if category and not cat.lower().startswith(category.lower()):
             continue
-        docs.append({
+        txt_path = _pdf_cache_txt_path(pdf)
+        entry: dict[str, Any] = {
             "name": name,
             "category": cat,
             "size_kb": pdf.stat().st_size // 1024,
-            "path": str(pdf),
-        })
+            "pdf_path": str(pdf),
+        }
+        if txt_path is not None:
+            entry["txt_path"] = str(txt_path) if txt_path.is_file() else None
+        docs.append(entry)
     return docs
+
+
+# ---------------------------------------------------------------------------
+# Helper: PDF-to-text cache
+#
+# When pdftotext is available, extracted text is stored under
+# ~/.cache/lauterbach-t32-mcp/<stem>.txt alongside an MD5 file
+# ~/.cache/lauterbach-t32-mcp/<stem>.md5 that records the hash of the
+# source PDF.  If the PDF is replaced (e.g., a T32 upgrade) the MD5
+# changes and the cache entry is regenerated automatically.
+#
+# Design notes:
+#   - MD5 is checked at most once per session per PDF (session cache).
+#   - A per-file lock prevents two concurrent agent processes from
+#     running pdftotext on the same file simultaneously.  The lock
+#     uses fcntl on POSIX and a best-effort msvcrt approach on Windows.
+#   - Reads are not locked; the .txt file is written atomically via a
+#     temp file so readers never see partial content.
+# ---------------------------------------------------------------------------
+# Set of resolved PDF paths whose MD5 has been verified this session.
+_pdf_cache_verified: set[str] = set()
+
+
+def _get_pdf_cache_dir() -> Optional[Path]:
+    """Return the PDF text cache directory, creating it if needed.
+
+    Returns None when pdftotext is not installed or the directory
+    cannot be created.
+    """
+    if shutil.which("pdftotext") is None:
+        return None
+    cache_dir = Path(os.path.expanduser(_config["pdf_cache_dir"]))
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+    except OSError:
+        return None
+
+
+def _pdf_cache_txt_path(pdf_path: Path) -> Optional[Path]:
+    """Return the cache .txt path for a PDF, or None if pdftotext unavailable."""
+    cache_dir = _get_pdf_cache_dir()
+    if cache_dir is None:
+        return None
+    return cache_dir / f"{pdf_path.stem}.txt"
+
+
+def _pdf_md5(pdf_path: Path) -> str:
+    """Compute the MD5 hex digest of a PDF file."""
+    h = hashlib.md5()
+    with open(pdf_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _acquire_file_lock(fh: Any) -> None:
+    """Acquire an exclusive write lock on an open file (best-effort)."""
+    try:
+        import fcntl  # POSIX
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except ImportError:
+        try:
+            import msvcrt  # Windows
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        except (ImportError, OSError):
+            pass  # Fall through; writes are idempotent so races are harmless.
+
+
+def _release_file_lock(fh: Any) -> None:
+    """Release a lock previously acquired with _acquire_file_lock."""
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except ImportError:
+        try:
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        except (ImportError, OSError):
+            pass
+
+
+def _get_or_cache_pdf_text(pdf_path: Path) -> Optional[str]:
+    """Return the text of a PDF, building or reusing a persistent disk cache.
+
+    Cache layout (in _PDF_CACHE_DIR):
+      <stem>.txt   - pdftotext output (written atomically via temp file)
+      <stem>.md5   - MD5 of the source PDF (invalidated on upgrade)
+      <stem>.lock  - lock file used during cache regeneration
+
+    Session optimisation: once a PDF's MD5 is verified in this process,
+    subsequent calls return the cached text without re-hashing the PDF.
+
+    Returns None if pdftotext is unavailable or conversion fails.
+    This function is intentionally synchronous; callers in async contexts
+    should use asyncio.to_thread(_get_or_cache_pdf_text, path).
+    """
+    cache_dir = _get_pdf_cache_dir()
+    if cache_dir is None:
+        return None
+
+    pdf_key = str(pdf_path.resolve())
+    stem = pdf_path.stem
+    txt_path = cache_dir / f"{stem}.txt"
+    md5_path = cache_dir / f"{stem}.md5"
+    lock_path = cache_dir / f"{stem}.lock"
+
+    # Fast path: already verified this session -- skip MD5 recheck.
+    if pdf_key in _pdf_cache_verified and txt_path.is_file():
+        try:
+            return txt_path.read_text(errors="replace")
+        except OSError:
+            pass
+
+    # Acquire exclusive lock before touching the cache files.
+    try:
+        lock_fh = open(lock_path, "w")  # noqa: WPS515
+    except OSError:
+        return None
+
+    try:
+        _acquire_file_lock(lock_fh)
+
+        # Compute current MD5 (done inside the lock so only one process
+        # pays this cost at a time per PDF).
+        try:
+            current_md5 = _pdf_md5(pdf_path)
+        except OSError:
+            return None
+
+        # Cache hit: MD5 matches stored value.
+        if txt_path.is_file() and md5_path.is_file():
+            try:
+                if md5_path.read_text().strip() == current_md5:
+                    _pdf_cache_verified.add(pdf_key)
+                    return txt_path.read_text(errors="replace")
+            except OSError:
+                pass
+
+        # Cache miss or stale: run pdftotext into a temp file then rename
+        # for an atomic replace so concurrent readers are never interrupted.
+        tmp_path = txt_path.with_suffix(".tmp")
+        try:
+            result = subprocess.run(
+                ["pdftotext", str(pdf_path), str(tmp_path)],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                tmp_path.replace(txt_path)
+                md5_path.write_text(current_md5 + "\n")
+                _pdf_cache_verified.add(pdf_key)
+                try:
+                    return txt_path.read_text(errors="replace")
+                except OSError:
+                    pass
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    finally:
+        _release_file_lock(lock_fh)
+        lock_fh.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1292,19 +1473,15 @@ async def read_resource(uri: AnyUrl) -> str:
         pdf_path = Path(_config["t32_dir"]) / "pdf" / filename
         if not pdf_path.is_file():
             return f"Document not found: {filename}"
-        # Try pdftotext for text extraction
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pdftotext", str(pdf_path), "-",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0 and stdout:
-                return stdout.decode("utf-8", errors="replace")
-        except (OSError, FileNotFoundError):
-            pass
-        return f"PDF file available at: {pdf_path} (install pdftotext for text extraction)"
+        # Use cached text (pdftotext run in a thread to avoid blocking the
+        # event loop during the first conversion of a large PDF).
+        text = await asyncio.to_thread(_get_or_cache_pdf_text, pdf_path)
+        if text:
+            return text
+        return (
+            f"PDF file available at: {pdf_path}"
+            " (install pdftotext for text extraction)"
+        )
 
     if uri_str == "trace32://hints":
         text = _load_hints()
@@ -1977,11 +2154,49 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return _ok({"docs": docs, "total": len(docs)})
 
         elif name == "search_trace32_docs":
-            query = arguments["query"].lower()
+            query = arguments["query"]
+            ql = query.lower()
             docs = _scan_pdf_docs()
-            matches = [d for d in docs if query in d["name"].lower()]
-            return _ok({"results": matches, "query": arguments["query"],
-                        "total": len(matches)})
+            results = []
+            for doc in docs:
+                name_match = ql in doc["name"].lower()
+                snippets: list[str] = []
+                # Get text: from cache if available, otherwise extract now.
+                txt_path_str = doc.get("txt_path")
+                text_content: Optional[str] = None
+                if txt_path_str:
+                    try:
+                        text_content = Path(txt_path_str).read_text(
+                            errors="replace"
+                        )
+                    except OSError:
+                        pass
+                elif doc.get("pdf_path"):
+                    # Not yet cached - extract on demand.  First-time cost is
+                    # acceptable; subsequent searches use the cached .txt file.
+                    text_content = _get_or_cache_pdf_text(
+                        Path(doc["pdf_path"])
+                    )
+                if text_content is not None:
+                    lines = text_content.splitlines()
+                    for idx, line in enumerate(lines):
+                        if ql in line.lower():
+                            start = max(0, idx - 1)
+                            end = min(len(lines), idx + 3)
+                            snippet = " | ".join(
+                                ln.strip() for ln in lines[start:end] if ln.strip()
+                            )
+                            if snippet:
+                                snippets.append(snippet)
+                            if len(snippets) >= 5:
+                                break
+                if name_match or snippets:
+                    entry = dict(doc)
+                    if snippets:
+                        entry["snippets"] = snippets
+                    results.append(entry)
+            return _ok({"results": results, "query": query,
+                        "total": len(results)})
 
         # ── PER files ────────────────────────────────────────────────────
         elif name == "list_per_files":
@@ -2065,6 +2280,7 @@ async def serve(
     *,
     t32_dir: str = "~/t32",
     hints: Optional[str] = None,
+    pdf_cache_dir: str = "~/.cache/lauterbach-t32-mcp",
 ) -> None:
     global _auto_connect_task
 
@@ -2072,7 +2288,7 @@ async def serve(
     _conn_defaults.update(host=host, port=port, protocol=protocol, timeout=timeout)
 
     # Store configuration paths
-    _config.update(t32_dir=t32_dir, hints=hints)
+    _config.update(t32_dir=t32_dir, hints=hints, pdf_cache_dir=pdf_cache_dir)
 
     # Load user hints and update server instructions
     server.instructions = _build_instructions()
