@@ -26,6 +26,9 @@ PRACTICE scripts, and more.
 | Symbols | `query_symbol_by_name`, `query_symbol_by_address` |
 | PRACTICE Macros | `get_practice_macro`, `set_practice_macro` |
 
+**Structured error handling** with actionable suggestions for every TRACE32
+exception type.
+
 **Built-in server instructions** teach the LLM TRACE32 concepts: target states,
 address classes, debug symbol requirements, common workflows, and useful PRACTICE
 functions.

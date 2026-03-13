@@ -25,6 +25,7 @@ import lauterbachdebugger_mcp.server as srv
 from lauterbachdebugger_mcp import main
 from lauterbachdebugger_mcp.server import (
     _build_instructions,
+    _error,
     _load_hints,
     _ok,
     _require_connection,
@@ -471,9 +472,12 @@ class TestConnectionTools:
         mock_dbg.ping.assert_called_once()
         assert "Ping successful" in result[0].text
 
-    def test_ping_not_connected_returns_error_text(self):
-        result = run(call_tool("ping", {}))
-        assert "Error" in result[0].text
+    def test_ping_not_connected_raises_structured_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("ping", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "connect" in data["suggestion"].lower()
 
     def test_get_state_integer_value(self, mock_dbg):
         mock_dbg.get_state.return_value = 2
@@ -573,9 +577,11 @@ class TestExecutionTools:
         assert data["pc"] == "0x2000"
         assert data["function"] is None
 
-    def test_not_connected_returns_error_not_raises(self):
-        result = run(call_tool("go", {}))
-        assert "Error" in result[0].text
+    def test_not_connected_raises_structured_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -825,25 +831,135 @@ class TestMacroTools:
 # call_tool — error handling
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestErrorHelper:
+    """Tests for the _error() helper function."""
+
+    def test_error_raises_value_error(self):
+        with pytest.raises(ValueError):
+            _error(RuntimeError("something failed"))
+
+    def test_error_message_is_json(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("something failed"))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert data["message"] == "something failed"
+
+    def test_error_includes_suggestion_when_given(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("fail"), suggestion="Try this instead.")
+        data = json.loads(str(exc_info.value))
+        assert data["suggestion"] == "Try this instead."
+
+    def test_error_no_suggestion_when_omitted(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("fail"))
+        data = json.loads(str(exc_info.value))
+        assert "suggestion" not in data
+
+
 class TestErrorHandling:
     def test_unknown_tool_name(self, mock_dbg):
         result = run(call_tool("nonexistent_tool", {}))
         assert "Unknown tool" in result[0].text
 
-    def test_debugger_exception_becomes_text_not_raises(self, mock_dbg):
+    def test_debugger_exception_raises_with_structured_json(self, mock_dbg):
         mock_dbg.go.side_effect = RuntimeError("hardware fault")
-        result = run(call_tool("go", {}))
-        assert "Error" in result[0].text
-        assert "hardware fault" in result[0].text
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "hardware fault" in data["message"]
 
-    def test_exception_result_is_text_content(self, mock_dbg):
+    def test_generic_exception_raises_with_error_type(self, mock_dbg):
         mock_dbg.step.side_effect = Exception("boom")
-        result = run(call_tool("step", {}))
-        assert result[0].type == "text"
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("step", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "Exception"
+        assert "boom" in data["message"]
 
-    def test_not_connected_error_names_the_connect_tool(self):
-        result = run(call_tool("read_register", {"name": "PC"}))
-        assert "connect" in result[0].text
+    def test_not_connected_error_suggests_connect(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_register", {"name": "PC"}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "connect" in data["suggestion"].lower()
+
+
+class TestStructuredErrors:
+    """Tests for typed pyrcl exception handling with suggestions."""
+
+    def _assert_error(self, exc_info, expected_error, suggestion_fragment):
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == expected_error
+        assert "suggestion" in data
+        assert suggestion_fragment.lower() in data["suggestion"].lower()
+
+    def test_api_connection_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32ApiConnectionError
+        mock_dbg.go.side_effect = T32ApiConnectionError("connection lost")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        self._assert_error(exc_info, "ApiConnectionError", "connect")
+
+    def test_command_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32CommandError
+        mock_dbg.cmd.side_effect = T32CommandError("bad command")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("run_command", {"command": "BAD"}))
+        self._assert_error(exc_info, "CommandError", "syntax")
+
+    def test_function_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32FunctionError
+        mock_dbg.fnc.side_effect = T32FunctionError("no such function")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("evaluate_function", {"function": "BAD()"}))
+        self._assert_error(exc_info, "FunctionError", "halted")
+
+    def test_memory_read_access_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32MemoryReadAccessError
+        mock_dbg.memory.read.side_effect = T32MemoryReadAccessError("access denied")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_memory", {"address": "0x0", "length": 4}))
+        self._assert_error(exc_info, "MemoryReadAccessError", "halt")
+
+    def test_memory_write_access_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32MemoryWriteAccessError
+        mock_dbg.memory.write_uint32.side_effect = T32MemoryWriteAccessError("read-only")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("write_memory_typed", {
+                "address": "0x0", "type": "uint32", "value": 0
+            }))
+        self._assert_error(exc_info, "MemoryWriteAccessError", "read-only")
+
+    def test_variable_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32VariableError
+        mock_dbg.variable.read.side_effect = T32VariableError("no symbols")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_variable", {"name": "myVar"}))
+        self._assert_error(exc_info, "VariableError", "debug symbols")
+
+    def test_symbol_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32SymbolError
+        mock_dbg.symbol.query_by_name.side_effect = T32SymbolError("unknown symbol")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("query_symbol_by_name", {"name": "missing"}))
+        self._assert_error(exc_info, "SymbolError", "debug symbols")
+
+    def test_register_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32RegisterError
+        mock_dbg.register.read.side_effect = T32RegisterError("invalid register")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_register", {"name": "BADREG"}))
+        self._assert_error(exc_info, "RegisterError", "halt")
+
+    def test_breakpoint_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32BreakpointError
+        mock_dbg.breakpoint.set.side_effect = T32BreakpointError("bp failed")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("set_breakpoint", {"address": "0x1000"}))
+        self._assert_error(exc_info, "BreakpointError", "breakpoint")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

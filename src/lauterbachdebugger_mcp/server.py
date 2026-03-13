@@ -8,6 +8,17 @@ from typing import Any, Optional
 import mcp.types as types
 import lauterbach.trace32.rcl as t32
 from lauterbach.trace32.rcl import Breakpoint
+from lauterbach.trace32.rcl import (
+    ApiConnectionError as T32ApiConnectionError,
+    BreakpointError as T32BreakpointError,
+    CommandError as T32CommandError,
+    FunctionError as T32FunctionError,
+    MemoryReadAccessError as T32MemoryReadAccessError,
+    MemoryWriteAccessError as T32MemoryWriteAccessError,
+    RegisterError as T32RegisterError,
+    SymbolError as T32SymbolError,
+    VariableError as T32VariableError,
+)
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
@@ -205,6 +216,64 @@ def _ok(data: Any) -> list[types.TextContent]:
     """Wrap a result in a TextContent list (JSON-serialised if not a string)."""
     text = data if isinstance(data, str) else json.dumps(data, default=str)
     return [types.TextContent(type="text", text=text)]
+
+
+# Mapping from pyrcl exception types to actionable suggestions.
+# Used by _error() to provide context-appropriate guidance.
+_EXCEPTION_SUGGESTIONS: dict[type, str] = {
+    T32ApiConnectionError: "Connection lost. Try calling 'connect' again.",
+    T32CommandError: "Check command syntax. Use 'run_command' help for examples.",
+    T32FunctionError: (
+        "Function may not exist or target not halted. "
+        "Halt with 'break_' first."
+    ),
+    T32MemoryReadAccessError: (
+        "Cannot read memory. Halt target with 'break_' "
+        "and check address/access class."
+    ),
+    T32MemoryWriteAccessError: (
+        "Cannot write memory. Region may be read-only or protected."
+    ),
+    T32VariableError: (
+        "Variable access failed. Ensure debug symbols are loaded "
+        "and target is halted."
+    ),
+    T32SymbolError: "Symbol not found. Ensure debug symbols are loaded.",
+    T32RegisterError: (
+        "Register access failed. Halt target with 'break_' "
+        "and check register name."
+    ),
+    T32BreakpointError: (
+        "Breakpoint operation failed. Check address and breakpoint type."
+    ),
+}
+
+
+def _error(exc: Exception, suggestion: Optional[str] = None) -> list[types.TextContent]:
+    """Return a structured error response with actionable suggestion.
+
+    Looks up the exception type in _EXCEPTION_SUGGESTIONS for a known
+    suggestion, falling back to the explicit *suggestion* parameter.
+    For RuntimeError, checks if the message indicates a missing
+    connection.
+
+    To propagate isError=True to the MCP CallToolResult, we raise a
+    ValueError whose message is the JSON-serialised error dict.  The
+    MCP framework will catch it and set isError=True on the result.
+    """
+    if suggestion is None:
+        suggestion = _EXCEPTION_SUGGESTIONS.get(type(exc))
+    if suggestion is None and isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "not connected" in msg or "connect" in msg:
+            suggestion = "Call the 'connect' tool first."
+    error_data: dict[str, Any] = {
+        "error": type(exc).__name__,
+        "message": str(exc),
+    }
+    if suggestion:
+        error_data["suggestion"] = suggestion
+    raise ValueError(json.dumps(error_data))
 
 
 # ---------------------------------------------------------------------------
@@ -960,12 +1029,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return _ok(f"Unknown tool: '{name}'")
 
     except Exception as exc:
-        return [
-            types.TextContent(
-                type="text",
-                text=f"Error [{type(exc).__name__}]: {exc}",
-            )
-        ]
+        return _error(exc)
 
 
 # ---------------------------------------------------------------------------
