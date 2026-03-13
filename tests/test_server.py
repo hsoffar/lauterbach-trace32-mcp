@@ -203,7 +203,7 @@ class TestConnectionTools:
                 "node": "192.168.0.1", "port": 10000, "protocol": "UDP", "timeout": 5.0
             }))
         mock_t32.connect.assert_called_once_with(
-            node="192.168.0.1", port=10000, protocol="UDP", timeout=5.0
+            node="192.168.0.1", port="10000", protocol="UDP", timeout=5.0
         )
         assert "Connected" in result[0].text
         assert srv._dbg is mock_conn
@@ -213,7 +213,7 @@ class TestConnectionTools:
             mock_t32.connect.return_value = MagicMock()
             run(call_tool("connect", {}))
         mock_t32.connect.assert_called_once_with(
-            node="localhost", port=20000, protocol="TCP", timeout=60.0
+            node="localhost", port="20000", protocol="TCP", timeout=60.0
         )
 
     def test_connect_disconnects_existing_session(self, mock_dbg):

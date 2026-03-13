@@ -529,7 +529,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 _dbg = None
             _dbg = t32.connect(
                 node=arguments.get("node", "localhost"),
-                port=int(arguments.get("port", 20000)),
+                port=str(arguments.get("port", 20000)),
                 protocol=arguments.get("protocol", "TCP"),
                 timeout=float(arguments.get("timeout", 60.0)),
             )
