@@ -571,7 +571,7 @@ class TestServe:
             mock_t32.connect.return_value = mock_conn
             self._run_serve("192.168.0.1", 9000, "UDP", 5.0)
         mock_t32.connect.assert_called_once_with(
-            node="192.168.0.1", port=9000, protocol="UDP", timeout=5.0
+            node="192.168.0.1", port="9000", protocol="UDP", timeout=5.0
         )
 
     def test_auto_connect_sets_dbg(self):

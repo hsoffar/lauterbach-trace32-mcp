@@ -787,7 +787,7 @@ async def serve(host: str, port: int, protocol: str, timeout: float) -> None:
     global _dbg
 
     try:
-        _dbg = t32.connect(node=host, port=port, protocol=protocol, timeout=timeout)
+        _dbg = t32.connect(node=host, port=str(port), protocol=protocol, timeout=timeout)
         logger.info("Connected to TRACE32 at %s:%s", host, port)
     except Exception as exc:
         logger.warning(
