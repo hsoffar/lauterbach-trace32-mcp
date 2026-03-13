@@ -271,6 +271,111 @@ class TestServerInstructions:
         assert result == srv.INSTRUCTIONS
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResolveSymbolAt:
+    def test_returns_function_and_source_info(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: {
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info == {"function": "main", "source_file": "main.c", "source_line": "42"}
+
+    def test_graceful_on_partial_failure(self):
+        dbg = MagicMock()
+        call_count = [0]
+        def _side_effect(expr):
+            call_count[0] += 1
+            if "FUNCTION" in expr:
+                return "main"
+            raise RuntimeError("no symbols")
+        dbg.fnc.side_effect = _side_effect
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info["function"] == "main"
+        assert info["source_file"] is None
+        assert info["source_line"] is None
+
+    def test_graceful_on_total_failure(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = RuntimeError("no symbols")
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info == {"function": None, "source_file": None, "source_line": None}
+
+
+class TestGetBriefContext:
+    def test_returns_pc_and_symbol_info(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x1000"
+        assert ctx["function"] == "main"
+        assert ctx["source_file"] == "main.c"
+        assert ctx["source_line"] == "42"
+
+    def test_graceful_when_pc_read_fails(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = RuntimeError("not halted")
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] is None
+        assert ctx["function"] is None
+        assert ctx["source_file"] is None
+        assert ctx["source_line"] is None
+
+    def test_graceful_when_symbol_fails_but_pc_works(self):
+        dbg = MagicMock()
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x2000"
+            raise RuntimeError("no symbols")
+        dbg.fnc.side_effect = _side_effect
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x2000"
+        assert ctx["function"] is None
+
+
+class TestFormatHexDump:
+    def test_single_line(self):
+        data = bytes(range(16))
+        dump = srv._format_hex_dump(data, 0x1000)
+        assert "00000000" not in dump  # base is 0x1000
+        assert "00001000" in dump
+        assert "00 01 02" in dump
+        # ASCII portion
+        assert "|" in dump
+
+    def test_multiple_lines(self):
+        data = bytes(range(32))
+        dump = srv._format_hex_dump(data, 0)
+        lines = dump.strip().split("\n")
+        assert len(lines) == 2
+
+    def test_partial_last_line(self):
+        data = bytes(range(20))
+        dump = srv._format_hex_dump(data, 0)
+        lines = dump.strip().split("\n")
+        assert len(lines) == 2
+
+    def test_non_printable_shown_as_dot(self):
+        data = bytes([0x00, 0x7F, 0xFF, 0x41])  # non-printable + 'A'
+        dump = srv._format_hex_dump(data, 0)
+        assert "A" in dump
+        assert "." in dump
+
+    def test_empty_data(self):
+        dump = srv._format_hex_dump(b"", 0)
+        assert dump == ""
+
+
 EXPECTED_TOOLS = {
     "connect", "disconnect", "ping", "get_state", "get_message",
     "go", "break_", "step", "step_asm", "step_hll",

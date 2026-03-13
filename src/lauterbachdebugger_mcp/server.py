@@ -139,6 +139,50 @@ def _build_instructions(hints: Optional[str] = None) -> str:
 server = Server("lauterbachdebugger-mcp", instructions=INSTRUCTIONS)
 
 
+# ---------------------------------------------------------------------------
+# Shared helper functions
+# ---------------------------------------------------------------------------
+def _resolve_symbol_at(dbg: t32.Debugger, addr: str) -> dict[str, Any]:
+    """Resolve function/source info at an address. Graceful on failure."""
+    info: dict[str, Any] = {}
+    for key, expr in (
+        ("function", "sYmbol.FUNCTION(D:{addr})"),
+        ("source_file", "sYmbol.SOURCEFILE(D:{addr})"),
+        ("source_line", "sYmbol.SOURCELINE(D:{addr})"),
+    ):
+        try:
+            info[key] = dbg.fnc(expr.format(addr=addr))
+        except Exception:
+            info[key] = None
+    return info
+
+
+def _get_brief_context(dbg: t32.Debugger) -> dict[str, Any]:
+    """Read PC and resolve symbol info. Returns partial data on failure."""
+    ctx: dict[str, Any] = {}
+    try:
+        pc_val = dbg.fnc("Register(PC)")
+        ctx["pc"] = pc_val
+    except Exception:
+        ctx["pc"] = None
+    if ctx["pc"] is not None:
+        ctx.update(_resolve_symbol_at(dbg, str(ctx["pc"])))
+    else:
+        ctx.update(function=None, source_file=None, source_line=None)
+    return ctx
+
+
+def _format_hex_dump(data: bytes, base_addr: int) -> str:
+    """Format bytes as a traditional hex+ASCII dump, 16 bytes per line."""
+    lines = []
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{base_addr + offset:08x}  {hex_part:<48s}  |{ascii_part}|")
+    return "\n".join(lines)
+
+
 def _require_connection() -> t32.Debugger:
     """Return the active Debugger or raise if not connected."""
     if _dbg is None:
