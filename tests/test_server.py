@@ -26,7 +26,6 @@ from lauterbachdebugger_mcp import main
 from lauterbachdebugger_mcp.server import (
     _build_instructions,
     _error,
-    _load_hints,
     _ok,
     _require_connection,
     call_tool,
@@ -69,6 +68,11 @@ def mock_dbg():
 def run(coro):
     """Run an async coroutine from synchronous test code."""
     return asyncio.run(coro)
+
+
+def _j(result):
+    """Parse JSON from a tool result (list of TextContent)."""
+    return json.loads(result[0].text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,40 +244,26 @@ class TestServerInstructions:
         assert "ascii" in srv.INSTRUCTIONS
         assert "symbol resolution" in srv.INSTRUCTIONS
 
-    def test_load_hints_from_file(self, tmp_path):
-        f = tmp_path / "tips.md"
-        f.write_text("# My Tips\nuse breakpoints\n", encoding="utf-8")
-        assert "My Tips" in _load_hints(str(f))
-
-    def test_load_hints_from_directory(self, tmp_path):
-        (tmp_path / "a.md").write_text("# Alpha\n", encoding="utf-8")
-        (tmp_path / "b.md").write_text("# Beta\n", encoding="utf-8")
-        (tmp_path / "readme.txt").write_text("ignored\n", encoding="utf-8")
-        result = _load_hints(str(tmp_path))
-        assert "Alpha" in result
-        assert "Beta" in result
-        assert "ignored" not in result
-
-    def test_load_hints_nonexistent_returns_empty(self):
-        assert _load_hints("/no/such/path") == ""
-
-    def test_load_hints_empty_directory(self, tmp_path):
-        assert _load_hints(str(tmp_path)) == ""
+    def test_instructions_mention_composite_tools(self):
+        assert "Composite" in srv.INSTRUCTIONS
+        assert "get_context" in srv.INSTRUCTIONS
+        assert "backtrace" in srv.INSTRUCTIONS
+        assert "snapshot" in srv.INSTRUCTIONS
+        assert "run_until" in srv.INSTRUCTIONS
+        assert "set_breakpoint_at_symbol" in srv.INSTRUCTIONS
+        assert "read_string" in srv.INSTRUCTIONS
+        assert "dump_memory_formatted" in srv.INSTRUCTIONS
+        assert "disassemble" in srv.INSTRUCTIONS
+        assert "evaluate_expression" in srv.INSTRUCTIONS
+        assert "get_system_info" in srv.INSTRUCTIONS
+        assert "list_functions" in srv.INSTRUCTIONS
+        assert "list_global_variables" in srv.INSTRUCTIONS
+        assert "search_memory" in srv.INSTRUCTIONS
+        assert "write_memory" in srv.INSTRUCTIONS
+        assert "get_source_location" in srv.INSTRUCTIONS
 
     def test_build_instructions_without_hints(self):
         result = _build_instructions()
-        assert result == srv.INSTRUCTIONS
-
-    def test_build_instructions_with_hints_file(self, tmp_path):
-        f = tmp_path / "tips.md"
-        f.write_text("# Custom Tips\n", encoding="utf-8")
-        result = _build_instructions(str(f))
-        assert result.startswith(srv.INSTRUCTIONS)
-        assert "User Hints" in result
-        assert "Custom Tips" in result
-
-    def test_build_instructions_with_nonexistent_hints(self):
-        result = _build_instructions("/no/such/path")
         assert result == srv.INSTRUCTIONS
 
 
@@ -348,6 +338,13 @@ class TestGetBriefContext:
         assert ctx["pc"] == "0x2000"
         assert ctx["function"] is None
 
+    def test_pc_is_hex_string_when_api_returns_raw_integer(self):
+        """Real T32 API returns a raw integer for Register(PC); must be hex string."""
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: 4096 if expr == "Register(PC)" else None
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x1000"
+
 
 class TestFormatHexDump:
     def test_single_line(self):
@@ -393,6 +390,15 @@ EXPECTED_TOOLS = {
     "read_variable", "write_variable",
     "query_symbol_by_name", "query_symbol_by_address",
     "get_practice_macro", "set_practice_macro",
+    # Composite tools
+    "get_context", "get_source_location", "evaluate_expression",
+    "get_system_info", "read_string", "dump_memory_formatted",
+    "write_memory", "backtrace", "disassemble",
+    "set_breakpoint_at_symbol", "run_until", "snapshot",
+    "list_functions", "list_global_variables", "search_memory",
+    # Documentation, PER files
+    "list_trace32_docs", "search_trace32_docs",
+    "list_per_files", "load_per_file", "per_read_register",
 }
 
 
@@ -963,7 +969,645 @@ class TestStructuredErrors:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# call_tool — composite tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetContext:
+    def test_returns_full_context(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "Register(SP)": "0x2000",
+            "Register(LR)": "0x3000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+            "CPU()": "CortexM4",
+        }[expr]
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["state"] == 2
+        assert data["state_name"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["sp"] == "0x2000"
+        assert data["lr"] == "0x3000"
+        assert data["function"] == "main"
+        assert data["cpu"] == "CortexM4"
+
+    def test_graceful_degradation(self, mock_dbg):
+        mock_dbg.get_state.side_effect = RuntimeError("fail")
+        mock_dbg.fnc.side_effect = RuntimeError("fail")
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["state"] is None
+        assert data["pc"] is None
+        assert data["function"] is None
+
+    def test_registers_returned_as_hex_strings(self, mock_dbg):
+        """Real T32 API returns raw integers for Register(); must be hex strings."""
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": 4096,
+            "Register(SP)": 8192,
+            "Register(LR)": 12288,
+            "CPU()": "CortexM4",
+        }.get(expr)
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["pc"] == "0x1000"
+        assert data["sp"] == "0x2000"
+        assert data["lr"] == "0x3000"
+
+
+class TestGetSourceLocation:
+    def test_with_explicit_address(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        data = json.loads(run(call_tool("get_source_location", {"address": "0x1000"}))[0].text)
+        assert data["address"] == "0x1000"
+        assert data["function"] == "main"
+
+    def test_defaults_to_pc(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x2000",
+            "sYmbol.FUNCTION(D:0x2000)": "foo",
+            "sYmbol.SOURCEFILE(D:0x2000)": "foo.c",
+            "sYmbol.SOURCELINE(D:0x2000)": "10",
+        }[expr]
+        data = json.loads(run(call_tool("get_source_location", {}))[ 0].text)
+        assert data["address"] == "0x2000"
+        assert data["function"] == "foo"
+
+    def test_pc_address_is_hex_string_when_api_returns_raw_integer(self, mock_dbg):
+        """Real T32 API returns raw integer for Register(PC); address must be hex."""
+        mock_dbg.fnc.side_effect = lambda expr: (
+            4096 if expr == "Register(PC)" else None
+        )
+        data = json.loads(run(call_tool("get_source_location", {}))[0].text)
+        assert data["address"] == "0x1000"
+
+
+class TestEvaluateExpression:
+    def test_decimal_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.VALUE(myVar)": "42",
+            "Var.TYPEOF(myVar)": "int",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {"expression": "myVar"}))[0].text)
+        assert data["expression"] == "myVar"
+        assert data["value"] == "42"
+        assert data["type"] == "int"
+
+    def test_hex_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.VALUE(myVar)": "255",
+            "Var.TYPEOF(myVar)": "unsigned int",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {
+            "expression": "myVar", "format": "hex"
+        }))[0].text)
+        assert data["hex"] == "0xff"
+
+    def test_string_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.STRing(myStr)": "hello",
+            "Var.TYPEOF(myStr)": "char *",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {
+            "expression": "myStr", "format": "string"
+        }))[0].text)
+        assert data["value"] == "hello"
+
+    def test_graceful_on_failure(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("evaluate_expression", {"expression": "bad"}))[0].text)
+        assert data["value"] is None
+        assert data["type"] is None
+
+
+class TestGetSystemInfo:
+    def test_returns_system_info(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "CPU()": "CortexM4",
+            "CPUFAMILY()": "ARM",
+            "SYSTEM.BIGENDIAN()": "FALSE",
+        }[expr]
+        data = json.loads(run(call_tool("get_system_info", {}))[0].text)
+        assert data["cpu"] == "CortexM4"
+        assert data["cpu_family"] == "ARM"
+        assert data["big_endian"] == "FALSE"
+
+    def test_graceful_on_failure(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("fail")
+        data = json.loads(run(call_tool("get_system_info", {}))[0].text)
+        assert data["cpu"] is None
+
+
+class TestReadString:
+    def test_reads_string(self, mock_dbg):
+        mock_dbg.fnc.return_value = "Hello World"
+        data = json.loads(run(call_tool("read_string", {"address": "0x1000"}))[0].text)
+        assert data["string"] == "Hello World"
+        assert data["length"] == 11
+        mock_dbg.fnc.assert_called_once_with("Data.STRing(D:0x1000)")
+
+    def test_truncates_at_max_length(self, mock_dbg):
+        mock_dbg.fnc.return_value = "A" * 500
+        data = json.loads(run(call_tool("read_string", {
+            "address": "0x1000", "max_length": 10
+        }))[0].text)
+        assert data["length"] == 10
+
+    def test_unicode_decode_error_returns_structured_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = UnicodeDecodeError(
+            "utf-8", b"\xff\xfe", 0, 1, "invalid start byte"
+        )
+        data = json.loads(run(call_tool("read_string", {"address": "0x2000"}))[0].text)
+        assert data["string"] is None
+        assert data["length"] == 0
+        assert "error" in data
+        assert "UTF-8" in data["error"]
+
+
+class TestDumpMemoryFormatted:
+    def test_returns_hex_dump(self, mock_dbg):
+        mock_dbg.memory.read.return_value = bytes(range(32))
+        data = json.loads(run(call_tool("dump_memory_formatted", {
+            "address": "0x1000", "length": 32
+        }))[0].text)
+        assert data["length"] == 32
+        assert "00001000" in data["dump"]
+        assert data["raw_hex"] == bytes(range(32)).hex()
+
+
+class TestWriteMemory:
+    def test_writes_bytes(self, mock_dbg):
+        data = json.loads(run(call_tool("write_memory", {
+            "address": "0x2000", "data": "DEADBEEF"
+        }))[0].text)
+        assert data["length"] == 4
+        assert data["data_written"] == "DEADBEEF"
+        mock_dbg.memory.write.assert_called_once()
+        written_bytes = mock_dbg.memory.write.call_args[0][1]
+        assert written_bytes == b"\xDE\xAD\xBE\xEF"
+
+
+class TestBacktrace:
+    def test_returns_frames(self, mock_dbg):
+        pc_call_count = [0]
+        frame_pcs = ["0x1000", "0x500"]
+
+        def _fnc(expr):
+            if expr == "Register(PC)":
+                i = pc_call_count[0]
+                pc_call_count[0] += 1
+                if i < len(frame_pcs):
+                    return frame_pcs[i]
+                raise RuntimeError("no more frames")
+            if "sYmbol.FUNCTION" in expr:
+                return "main" if "0x1000" in expr else "startup"
+            if "sYmbol.SOURCEFILE" in expr:
+                return "main.c" if "0x1000" in expr else "startup.c"
+            if "sYmbol.SOURCELINE" in expr:
+                return "42" if "0x1000" in expr else "10"
+            return ""
+
+        cmd_up_count = [0]
+
+        def _cmd(cmd_str):
+            if cmd_str == "Frame.Up":
+                cmd_up_count[0] += 1
+                if cmd_up_count[0] >= 2:
+                    raise RuntimeError("top of stack")
+
+        mock_dbg.fnc.side_effect = _fnc
+        mock_dbg.cmd.side_effect = _cmd
+        data = json.loads(run(call_tool("backtrace", {"depth": 20}))[0].text)
+        assert data["depth"] == 2
+        assert data["frames"][0]["function"] == "main"
+        assert data["frames"][1]["function"] == "startup"
+        assert not data["truncated"]
+
+    def test_empty_backtrace(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no frames")
+        data = json.loads(run(call_tool("backtrace", {}))[0].text)
+        assert data["depth"] == 0
+        assert data["frames"] == []
+
+    def test_truncation_flag(self, mock_dbg):
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("backtrace", {"depth": 2}))[0].text)
+        assert data["truncated"]
+        assert data["depth"] == 2
+
+
+class TestDisassemble:
+    def test_disassemble_from_pc(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: "0x1000" if expr == "Register(PC)" else "ARM"
+        mock_dbg.memory.read.return_value = b"\x00" * 8
+        data = json.loads(run(call_tool("disassemble", {"count": 2}))[0].text)
+        assert data["start_address"] == "0x1000"
+        assert len(data["instructions"]) == 2
+        assert data["instructions"][0]["address"] == "0x1000"
+        assert data["instructions"][1]["address"] == "0x1004"
+        assert "note" in data
+
+    def test_disassemble_memory_error(self, mock_dbg):
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.memory.read.side_effect = RuntimeError("read failed")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("disassemble", {"count": 10}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+
+    def test_disassemble_pc_fallback_when_target_not_halted(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("target not halted")
+        mock_dbg.memory.read.return_value = b"\x00" * 8
+        data = json.loads(run(call_tool("disassemble", {"count": 2}))[0].text)
+        assert data["start_address"] == "0x0"
+        assert data["pc_fallback"] is True
+        assert "warning" in data
+
+
+class TestSetBreakpointAtSymbol:
+    def test_sets_breakpoint_by_name(self, mock_dbg):
+        sym = MagicMock()
+        sym.address = MagicMock(__str__=lambda s: "0x1000")
+        mock_dbg.symbol.query_by_name.return_value = sym
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "main"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Break.Set main /PROGRAM /AUTO")
+        assert data["symbol"] == "main"
+        assert data["address"] == "0x1000"
+        assert data["enabled"]
+
+    def test_custom_type_and_impl(self, mock_dbg):
+        mock_dbg.symbol.query_by_name.side_effect = RuntimeError("no sym")
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "foo", "type": "WRITE", "impl": "ONCHIP"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Break.Set foo /WRITE /ONCHIP")
+        assert data["address"] is None
+
+    def test_symbol_not_found_suggests_loading_elf(self, mock_dbg):
+        # T32CommandError is the real exception type raised by the T32 API
+        from lauterbachdebugger_mcp.server import T32CommandError
+        mock_dbg.cmd.side_effect = T32CommandError("symbol not found")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("set_breakpoint_at_symbol", {"symbol": "main"}))
+        data = json.loads(str(exc_info.value))
+        assert "suggestion" in data
+        assert "Data.LOAD.ELF" in data["suggestion"]
+
+
+class TestRunUntil:
+    def test_reaches_target(self, mock_dbg):
+        # Simulate: first poll returns running (1), second returns halted (2)
+        poll_count = [0]
+        def _get_state():
+            poll_count[0] += 1
+            return 2 if poll_count[0] >= 2 else 1
+        mock_dbg.get_state.side_effect = _get_state
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Go.direct main")
+        assert data["reached"]
+        assert "pc" in data
+
+    def test_timeout(self, mock_dbg):
+        mock_dbg.get_state.return_value = 1  # always running
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 0.2
+        }))[0].text)
+        assert not data["reached"]
+        assert data["status"] == "timeout"
+
+    def test_pc_returned_as_hex_string(self, mock_dbg):
+        """PC from _get_brief_context must be a '0x...' string, not a raw integer."""
+        mock_dbg.get_state.side_effect = [1, 2]
+        # Real T32 API returns a raw integer for Register(PC)
+        mock_dbg.fnc.return_value = 4096
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        assert data["reached"]
+        assert data["pc"] == "0x1000"
+
+    def test_falls_back_to_go_when_go_direct_fails(self, mock_dbg):
+        """If Go.direct raises (e.g. multi-core SoC), fall back to plain Go."""
+        poll_count = [0]
+        def _get_state():
+            poll_count[0] += 1
+            return 2 if poll_count[0] >= 2 else 1
+        mock_dbg.get_state.side_effect = _get_state
+        mock_dbg.fnc.return_value = "0x1000"
+        def _cmd(cmd_str):
+            if cmd_str.startswith("Go.direct"):
+                raise RuntimeError("target system down")
+        mock_dbg.cmd.side_effect = _cmd
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        assert data["reached"]
+        calls = [c.args[0] for c in mock_dbg.cmd.call_args_list]
+        assert any(c.startswith("Go.direct") for c in calls)
+        assert "Go" in calls
+
+
+class TestSnapshot:
+    def test_returns_full_snapshot(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.breakpoint.list.return_value = []
+        data = json.loads(run(call_tool("snapshot", {}))[0].text)
+        assert "context" in data
+        assert "backtrace" in data
+        assert "breakpoints" in data
+        assert "system_info" in data
+        assert "registers" not in data  # not requested
+
+    def test_includes_registers_when_requested(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.breakpoint.list.return_value = []
+        mock_dbg.register.read_all.return_value = [
+            MagicMock(to_dict=lambda: {"name": "R0", "value": 0})
+        ]
+        data = json.loads(run(call_tool("snapshot", {"include_registers": True}))[0].text)
+        assert "registers" in data
+
+
+class TestListFunctions:
+    def test_returns_count(self, mock_dbg):
+        mock_dbg.fnc.return_value = "5"
+        data = json.loads(run(call_tool("list_functions", {"filter": "my_*"}))[0].text)
+        assert data["count"] == 5
+        assert data["filter"] == "my_*"
+        assert data["items"] == []
+        assert "note" in data
+        mock_dbg.fnc.assert_called_with("sYmbol.COUNT(my_*)")
+
+    def test_count_zero_on_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("list_functions", {}))[0].text)
+        assert data["count"] == 0
+        assert data["items"] == []
+
+
+class TestListGlobalVariables:
+    def test_returns_count(self, mock_dbg):
+        mock_dbg.fnc.return_value = "3"
+        data = json.loads(run(call_tool("list_global_variables", {"filter": "g_*"}))[0].text)
+        assert data["count"] == 3
+        assert data["filter"] == "g_*"
+        assert data["items"] == []
+        assert "note" in data
+        mock_dbg.fnc.assert_called_with("sYmbol.COUNT(g_*)")
+
+    def test_count_zero_on_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("list_global_variables", {}))[0].text)
+        assert data["count"] == 0
+
+
+class TestSearchMemory:
+    def test_finds_pattern(self, mock_dbg):
+        # Memory contains the pattern at offset 8
+        mem = b"\x00" * 8 + b"\xDE\xAD\xBE\xEF" + b"\x00" * 20
+        mock_dbg.memory.read.return_value = mem
+        data = json.loads(run(call_tool("search_memory", {
+            "start_address": "0x0", "end_address": "0x20",
+            "pattern": "DEADBEEF",
+        }))[0].text)
+        assert data["found"]
+        assert data["address"] == "0x8"
+
+    def test_pattern_not_found(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\x00" * 32
+        data = json.loads(run(call_tool("search_memory", {
+            "start_address": "0x0", "end_address": "0x20",
+            "pattern": "DEADBEEF",
+        }))[0].text)
+        assert not data["found"]
+        assert data["address"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # serve() — auto-connect behaviour
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Documentation tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestListTraceDocs:
+    def test_list_docs_empty(self, tmp_path):
+        """Returns empty list when pdf dir does not exist."""
+        srv._config["t32_dir"] = str(tmp_path / "nonexistent")
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        assert result["docs"] == []
+        assert result["total"] == 0
+
+    def test_list_docs_finds_pdfs(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"fake pdf")
+        (pdf_dir / "practice_ref.pdf").write_bytes(b"fake pdf 2")
+        (pdf_dir / "readme.txt").write_text("not a pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        assert result["total"] == 2
+        names = [d["name"] for d in result["docs"]]
+        assert "debugger_arm.pdf" in names
+        assert "practice_ref.pdf" in names
+
+    def test_list_docs_category_filter(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        (pdf_dir / "rtos_linux.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {"category": "debugger"})))
+        assert result["total"] == 1
+        assert result["docs"][0]["name"] == "debugger_arm.pdf"
+
+
+class TestSearchTraceDocs:
+    def test_search_finds_match(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        (pdf_dir / "practice_ref.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("search_trace32_docs", {"query": "arm"})))
+        assert result["total"] == 1
+        assert result["results"][0]["name"] == "debugger_arm.pdf"
+
+    def test_search_no_match(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("search_trace32_docs", {"query": "zzzzz"})))
+        assert result["total"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER file tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestListPerFiles:
+    def test_list_per_empty(self, tmp_path):
+        srv._config["t32_dir"] = str(tmp_path / "nonexistent")
+        result = _j(run(call_tool("list_per_files", {})))
+        assert result["files"] == []
+
+    def test_list_per_finds_files(self, tmp_path):
+        (tmp_path / "demo.per").write_text("; @Title: Demo Peripheral\n")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_per_files", {})))
+        assert result["total"] == 1
+        assert result["files"][0]["name"] == "demo.per"
+        assert result["files"][0]["title"] == "Demo Peripheral"
+
+    def test_list_per_filter(self, tmp_path):
+        (tmp_path / "stm32.per").write_text(";header\n")
+        (tmp_path / "am62x.per").write_text(";header\n")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_per_files", {"filter": "stm"})))
+        assert result["total"] == 1
+        assert result["files"][0]["name"] == "stm32.per"
+
+
+class TestLoadPerFile:
+    def test_load_per_file(self, mock_dbg, tmp_path):
+        per_file = tmp_path / "test.per"
+        per_file.write_text("; peripheral\n")
+        result = _j(run(call_tool("load_per_file", {"file_path": str(per_file)})))
+        assert result["loaded"] is True
+        mock_dbg.cmd.assert_called_once_with(f"PER.Program {per_file}")
+
+    def test_load_per_relative_path(self, mock_dbg, tmp_path):
+        per_dir = tmp_path / "t32"
+        per_dir.mkdir()
+        per_file = per_dir / "soc.per"
+        per_file.write_text("; soc\n")
+        srv._config["t32_dir"] = str(per_dir)
+        result = _j(run(call_tool("load_per_file", {"file_path": "soc.per"})))
+        assert result["loaded"] is True
+
+    def test_load_per_file_not_found(self, mock_dbg):
+        result = _j(run(call_tool("load_per_file", {"file_path": "/no/such/file.per"})))
+        assert result["loaded"] is False
+        assert "not found" in result["error"].lower()
+
+
+class TestPerReadRegister:
+    def test_read_register_long(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\x78\x56\x34\x12"
+        result = _j(run(call_tool("per_read_register", {"address": "0x40021000"})))
+        assert result["value"] == 0x12345678
+        assert result["hex"] == "0x12345678"
+        assert result["access_width"] == "long"
+
+    def test_read_register_byte(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\xAB"
+        result = _j(run(call_tool("per_read_register",
+                                   {"address": "0x40021000", "access_width": "byte"})))
+        assert result["value"] == 0xAB
+        mock_dbg.memory.read.assert_called_once()
+        _, kwargs = mock_dbg.memory.read.call_args
+        assert kwargs["length"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Resources
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResources:
+    def test_list_resources_empty(self, tmp_path):
+        srv._config.update(t32_dir=str(tmp_path / "nope"), hints=None)
+        resources = run(srv.list_resources())
+        assert resources == []
+
+    def test_list_resources_with_docs(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"fake")
+        srv._config.update(t32_dir=str(tmp_path), hints=None)
+        resources = run(srv.list_resources())
+        doc_resources = [r for r in resources
+                         if str(r.uri).startswith("trace32://docs/")]
+        assert len(doc_resources) == 1
+        assert doc_resources[0].name == "debugger_arm.pdf"
+
+    def test_list_resources_with_hints(self, tmp_path):
+        hints = tmp_path / "hints.md"
+        hints.write_text("# My Tips\nSome hint\n")
+        srv._config.update(t32_dir=str(tmp_path / "nope"),
+                           hints=str(hints))
+        resources = run(srv.list_resources())
+        hint_resources = [r for r in resources
+                          if str(r.uri) == "trace32://hints"]
+        assert len(hint_resources) == 1
+
+    def test_read_resource_hints(self, tmp_path):
+        hints = tmp_path / "tips.md"
+        hints.write_text("# Debugging Tips\nTip 1\n")
+        srv._config.update(hints=str(hints))
+        text = run(srv.read_resource("trace32://hints"))
+        assert "Debugging Tips" in text
+
+    def test_read_resource_hints_empty(self):
+        srv._config.update(hints=None)
+        text = run(srv.read_resource("trace32://hints"))
+        assert "No hints" in text
+
+    def test_read_resource_unknown(self):
+        text = run(srv.read_resource("trace32://unknown"))
+        assert "Unknown resource" in text
+
+    def test_read_resource_doc_not_found(self, tmp_path):
+        srv._config["t32_dir"] = str(tmp_path)
+        text = run(srv.read_resource("trace32://docs/missing.pdf"))
+        assert "not found" in text.lower()
+
+
+class TestLoadHints:
+    def test_load_hints_from_dir(self, tmp_path):
+        hdir = tmp_path / "hints"
+        hdir.mkdir()
+        (hdir / "a.md").write_text("# Hint A\n")
+        (hdir / "b.md").write_text("# Hint B\n")
+        (hdir / "ignore.txt").write_text("not loaded")
+        srv._config.update(hints=str(hdir))
+        text = srv._load_hints()
+        assert "Hint A" in text
+        assert "Hint B" in text
+        assert "not loaded" not in text
+
+    def test_load_hints_from_file(self, tmp_path):
+        hf = tmp_path / "tips.md"
+        hf.write_text("# My Tips\n")
+        srv._config.update(hints=str(hf))
+        text = srv._load_hints()
+        assert "My Tips" in text
+
+    def test_load_hints_none(self):
+        srv._config.update(hints=None)
+        assert srv._load_hints() == ""
+
+    def test_load_hints_nonexistent_path(self, tmp_path):
+        srv._config.update(hints=str(tmp_path / "nope"))
+        assert srv._load_hints() == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serve
 # ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -1096,7 +1740,7 @@ class TestServe:
     def test_hints_embedded_in_instructions(self, tmp_path):
         hints = tmp_path / "tips.md"
         hints.write_text("# My Board Tips\nAlways reset before flash.\n")
-        self._run_serve_real_server(hints_file=str(hints))
+        self._run_serve_real_server(hints=str(hints))
         assert "My Board Tips" in srv.server.instructions
         assert "Always reset before flash" in srv.server.instructions
 

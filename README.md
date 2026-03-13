@@ -12,7 +12,7 @@ PRACTICE scripts, and more.
 
 ## Features
 
-**30+ tools across 8 categories:**
+**51 tools across 12 categories:**
 
 | Category | Tools |
 |---|---|
@@ -25,6 +25,13 @@ PRACTICE scripts, and more.
 | Variables | `read_variable`, `write_variable` |
 | Symbols | `query_symbol_by_name`, `query_symbol_by_address` |
 | PRACTICE Macros | `get_practice_macro`, `set_practice_macro` |
+| Composite / high-level | `get_context`, `get_source_location`, `evaluate_expression`, `get_system_info`, `read_string`, `dump_memory_formatted`, `write_memory`, `backtrace`, `disassemble`, `set_breakpoint_at_symbol`, `run_until`, `snapshot`, `list_functions`, `list_global_variables`, `search_memory` |
+| Documentation | `list_trace32_docs`, `search_trace32_docs` |
+| Peripheral (PER) | `list_per_files`, `load_per_file`, `per_read_register` |
+
+**MCP Resources:**
+- `trace32://docs/<filename>` — TRACE32 PDF documentation with text extraction
+- `trace32://hints` — user-provided debugging tips
 
 **Structured error handling** with actionable suggestions for every TRACE32
 exception type.
