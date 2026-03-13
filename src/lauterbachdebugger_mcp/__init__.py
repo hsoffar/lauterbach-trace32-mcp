@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+from typing import Optional
 
 import click
 
@@ -19,6 +20,9 @@ from .server import serve
 @click.option("--t32-dir", default="~/t32", envvar="T32SYS",
               type=click.Path(),
               help="TRACE32 installation directory. Default: ~/t32")
+@click.option("--hints", default=None, envvar="T32_HINTS",
+              type=click.Path(exists=False),
+              help="Path to hints file or directory (see AGENTS.md convention).")
 @click.option("-v", "--verbose", count=True)
 def main(
     host: str,
@@ -26,6 +30,7 @@ def main(
     protocol: str,
     timeout: float,
     t32_dir: str,
+    hints: Optional[str],
     verbose: int,
 ) -> None:
     """MCP server for Lauterbach TRACE32 debugger control."""
@@ -39,4 +44,5 @@ def main(
     asyncio.run(serve(
         host, port, protocol, timeout,
         t32_dir=t32_dir,
+        hints=hints,
     ))

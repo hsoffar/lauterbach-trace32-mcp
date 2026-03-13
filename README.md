@@ -26,6 +26,10 @@ PRACTICE scripts, and more.
 | Symbols | `query_symbol_by_name`, `query_symbol_by_address` |
 | PRACTICE Macros | `get_practice_macro`, `set_practice_macro` |
 
+**Built-in server instructions** teach the LLM TRACE32 concepts: target states,
+address classes, debug symbol requirements, common workflows, and useful PRACTICE
+functions.
+
 **Non-blocking Auto-connect startup** — the server registers with the MCP client immediately
 and auto-connects to TRACE32 in the background. If TRACE32 is not running,
 the server stays available and you can connect later via the `connect` tool.
@@ -90,8 +94,8 @@ lauterbachdebugger-mcp
 # Custom host/port
 lauterbachdebugger-mcp --host 192.168.1.100 --port 20000
 
-# With TRACE32 installation path
-lauterbachdebugger-mcp --t32-dir ~/t32
+# With TRACE32 installation path and user hints
+lauterbachdebugger-mcp --t32-dir ~/t32 --hints ~/.trace32-hints.md
 
 # Verbose logging
 lauterbachdebugger-mcp -v
@@ -109,6 +113,7 @@ python -m lauterbachdebugger_mcp
 | `--protocol` | | `T32_PROTOCOL` | `TCP` | `TCP` or `UDP` |
 | `--timeout` | | `T32_TIMEOUT` | `60.0` | Connection timeout (seconds) |
 | `--t32-dir` | | `T32SYS` | `~/t32` | TRACE32 installation directory (`C:\T32\` on Windows) |
+| `--hints` | | `T32_HINTS` | | Hints file or directory (see [AGENTS.md](https://agents.md/) convention) |
 | `--verbose` | `-v` | | off | Repeat for more detail (`-vv`) |
 
 ---
@@ -122,6 +127,7 @@ claude mcp add --transport stdio lauterbach-trace32 \
   --env T32_HOST=localhost \
   --env T32_PORT=20000 \
   --env T32SYS=~/t32 \
+  --env T32_HINTS=/path/to/hints.md \
   -- lauterbachdebugger-mcp
 ```
 
@@ -148,7 +154,8 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
         "T32_HOST": "localhost",
         "T32_PORT": "20000",
         "T32_PROTOCOL": "TCP",
-        "T32SYS": "~/t32"
+        "T32SYS": "~/t32",
+        "T32_HINTS": "/path/to/hints.md"
       }
     }
   }
@@ -168,7 +175,8 @@ Add to `.vscode/mcp.json` in your workspace (or user settings):
       "env": {
         "T32_HOST": "localhost",
         "T32_PORT": "20000",
-        "T32SYS": "~/t32"
+        "T32SYS": "~/t32",
+        "T32_HINTS": "/path/to/hints.md"
       }
     }
   }
@@ -371,6 +379,170 @@ Get the current value of a global PRACTICE macro variable (without the leading `
 
 #### `set_practice_macro`
 Set the value of a global PRACTICE macro variable.
+
+---
+
+### Composite / High-level Tools
+
+These tools combine multiple TRACE32 operations into single, context-rich
+responses. All use graceful degradation — partial failures in sub-operations
+do not break the overall result.
+
+#### `get_context`
+Full CPU context snapshot: state, PC, SP, LR, current function, source location,
+and CPU name. Optional `core` parameter for multi-core targets.
+
+#### `get_source_location`
+Source file and line for an address (defaults to current PC).
+
+#### `evaluate_expression`
+Evaluate a C/C++ expression. Returns value, type, and hex representation.
+Supports `format` parameter: `decimal`, `hex`, or `string`.
+
+#### `get_system_info`
+Target system information: CPU name, family, endianness, power state, target state.
+
+#### `read_string`
+Read a null-terminated C string from target memory. Optional `max_length`
+(default 256).
+
+#### `dump_memory_formatted`
+Hex + ASCII memory dump (like `hexdump`). Optional `length` (default 256).
+
+#### `write_memory`
+Write raw bytes (hex string) to target memory.
+
+#### `backtrace`
+Walk the call stack and return frame information with source resolution.
+Optional `depth` (default 20).
+
+#### `disassemble`
+Disassemble instructions at an address (defaults to PC). Optional `count`
+(default 10).
+
+#### `set_breakpoint_at_symbol`
+Set a breakpoint by function or label name (e.g. `main`).
+
+#### `run_until`
+Run to an address or symbol with timeout. Uses temporary breakpoint.
+Optional `timeout` in seconds (default 10).
+
+#### `snapshot`
+Full state capture: context + backtrace + breakpoint list + system info.
+Optional `include_registers` (default false).
+
+#### `list_functions`
+Browse function symbols. Optional `filter` (wildcard), `limit` (default 100).
+
+#### `list_global_variables`
+Browse global variable symbols. Same parameters as `list_functions`.
+
+#### `search_memory`
+Search for a byte pattern in a memory range.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `start_address` | string | Start of search range |
+| `end_address` | string | End of search range |
+| `pattern` | string | Hex byte pattern, e.g. `DEADBEEF` |
+
+---
+
+### Documentation Tools
+
+#### `list_trace32_docs`
+List available TRACE32 PDF documentation files from the T32 installation.
+Optional `category` filter (e.g. `debugger`, `rtos`, `practice`).
+
+#### `search_trace32_docs`
+Search documentation filenames by keyword.
+
+---
+
+### Peripheral Register Tools
+
+#### `list_per_files`
+List available `.per` (peripheral description) files from the T32 installation.
+Extracts title from `; @Title:` comment in file headers.
+Optional `filter` for substring matching.
+
+#### `load_per_file`
+Load a PER file into TRACE32 via `PER.Program` command. Path can be absolute
+or relative to the T32 installation directory.
+
+#### `per_read_register`
+Read and decode a peripheral register value. Requires a PER file to be loaded first.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `address` | string | — | Register address |
+| `access_width` | string | `long` | `byte`, `word`, or `long` |
+
+---
+
+## MCP Resources
+
+### Documentation (`trace32://docs/<filename>`)
+
+Each PDF in the T32 installation's `pdf/` directory is exposed as an MCP
+resource. When read, the server extracts text using `pdftotext` if available,
+otherwise returns the file path.
+
+### User Hints (`trace32://hints`)
+
+User-provided debugging tips loaded from `--hints-dir` and/or `--hints-file`.
+Hints are automatically embedded into the MCP server instructions at startup,
+so the LLM sees them immediately without any extra fetch. They are also
+available as an MCP resource (`trace32://hints`) for re-reading mid-session.
+
+Configure hints via CLI flags or environment variables in your MCP client
+config (see examples below).
+
+#### Hints file format
+
+Create markdown files with your debugging tips:
+
+```markdown
+# My TRACE32 Debugging Tips
+
+## I2C Debugging
+When debugging I2C on our custom board, always check the pull-up
+resistor configuration first. Use PER.view with the I2C peripheral
+file to verify SCL/SDA pin muxing.
+
+## Flash Programming Workflow
+1. Run SYStem.Up to connect
+2. Load flash algorithm: FLASH.Create ...
+3. Program: FLASH.Program ALL /Erase
+4. Verify: Data.LOAD.ELF <file> /ComPare
+```
+
+Point the server at your hints with `--hints-file` or `--hints-dir`:
+
+```bash
+lauterbachdebugger-mcp --hints-file ~/.trace32-hints.md
+lauterbachdebugger-mcp --hints-dir ~/.trace32-hints/
+```
+
+---
+
+## Error Handling
+
+The server provides structured error responses with actionable suggestions
+for every TRACE32 exception type:
+
+| Exception | Suggestion |
+|---|---|
+| Not connected | Call the `connect` tool first |
+| `CommandError` | Check command syntax |
+| `FunctionError` | Function may not exist or target not halted |
+| `MemoryReadAccessError` | Halt target, check address/access class |
+| `MemoryWriteAccessError` | Region may be read-only or protected |
+| `VariableError` | Ensure debug symbols loaded and target halted |
+| `SymbolError` | Ensure debug symbols loaded |
+| `RegisterError` | Halt target, check register name |
+| `ApiConnectionError` | Connection lost, try reconnecting |
+| `BreakpointError` | Check address and breakpoint type |
 
 ---
 

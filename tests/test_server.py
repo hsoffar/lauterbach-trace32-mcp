@@ -24,6 +24,8 @@ from click.testing import CliRunner
 import lauterbachdebugger_mcp.server as srv
 from lauterbachdebugger_mcp import main
 from lauterbachdebugger_mcp.server import (
+    _build_instructions,
+    _load_hints,
     _ok,
     _require_connection,
     call_tool,
@@ -43,13 +45,15 @@ def reset_connection():
     srv._auto_connect_task = None
     srv._conn_defaults.update(host="localhost", port=20000,
                               protocol="TCP", timeout=60.0)
-    srv._config.update(t32_dir="~/t32")
+    srv._config.update(t32_dir="~/t32", hints=None)
+    srv.server.instructions = srv.INSTRUCTIONS
     yield
     srv._dbg = None
     srv._auto_connect_task = None
     srv._conn_defaults.update(host="localhost", port=20000,
                               protocol="TCP", timeout=60.0)
-    srv._config.update(t32_dir="~/t32")
+    srv._config.update(t32_dir="~/t32", hints=None)
+    srv.server.instructions = srv.INSTRUCTIONS
 
 
 @pytest.fixture()
@@ -124,7 +128,7 @@ class TestCLI:
     def test_help_lists_all_options(self):
         output = self.runner.invoke(main, ["--help"]).output
         for opt in ("--host", "--port", "--protocol", "--timeout", "--verbose",
-                     "--t32-dir"):
+                     "--t32-dir", "--hints"):
             assert opt in output
 
     def test_invalid_protocol_rejected(self):
@@ -146,11 +150,12 @@ class TestCLI:
                 "T32_PROTOCOL": "",
                 "T32_TIMEOUT": "",
                 "T32SYS": "",
+                "T32_HINTS": "",
             })
 
         assert received == {"host": "localhost", "port": 20000,
                             "protocol": "TCP", "timeout": 60.0,
-                            "t32_dir": "~/t32"}
+                            "t32_dir": "~/t32", "hints": None}
 
     def test_custom_host_and_port_forwarded(self):
         received = {}
@@ -174,10 +179,97 @@ class TestCLI:
 
         assert received["t32_dir"] == "/custom/t32"
 
+    def test_hints_file_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--hints", "/my/tips.md"])
+
+        assert received["hints"] == "/my/tips.md"
+
+    def test_hints_directory_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--hints", "/my/hints-dir"])
+
+        assert received["hints"] == "/my/hints-dir"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # list_tools
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server instructions
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestServerInstructions:
+    def test_instructions_are_non_empty(self):
+        assert srv.INSTRUCTIONS
+        assert len(srv.INSTRUCTIONS) > 100
+
+    def test_server_has_instructions(self):
+        assert srv.server.instructions is not None
+        assert len(srv.server.instructions) > 0
+
+    def test_instructions_mention_connect(self):
+        assert "connect" in srv.INSTRUCTIONS.lower()
+
+    def test_instructions_mention_target_states(self):
+        assert "halted" in srv.INSTRUCTIONS
+        assert "running" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_practice_functions(self):
+        assert "Register(PC)" in srv.INSTRUCTIONS
+        assert "sYmbol.FUNCTION" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_address_classes(self):
+        assert "D:0x" in srv.INSTRUCTIONS
+        assert "P:0x" in srv.INSTRUCTIONS
+
+    def test_load_hints_from_file(self, tmp_path):
+        f = tmp_path / "tips.md"
+        f.write_text("# My Tips\nuse breakpoints\n", encoding="utf-8")
+        assert "My Tips" in _load_hints(str(f))
+
+    def test_load_hints_from_directory(self, tmp_path):
+        (tmp_path / "a.md").write_text("# Alpha\n", encoding="utf-8")
+        (tmp_path / "b.md").write_text("# Beta\n", encoding="utf-8")
+        (tmp_path / "readme.txt").write_text("ignored\n", encoding="utf-8")
+        result = _load_hints(str(tmp_path))
+        assert "Alpha" in result
+        assert "Beta" in result
+        assert "ignored" not in result
+
+    def test_load_hints_nonexistent_returns_empty(self):
+        assert _load_hints("/no/such/path") == ""
+
+    def test_load_hints_empty_directory(self, tmp_path):
+        assert _load_hints(str(tmp_path)) == ""
+
+    def test_build_instructions_without_hints(self):
+        result = _build_instructions()
+        assert result == srv.INSTRUCTIONS
+
+    def test_build_instructions_with_hints_file(self, tmp_path):
+        f = tmp_path / "tips.md"
+        f.write_text("# Custom Tips\n", encoding="utf-8")
+        result = _build_instructions(str(f))
+        assert result.startswith(srv.INSTRUCTIONS)
+        assert "User Hints" in result
+        assert "Custom Tips" in result
+
+    def test_build_instructions_with_nonexistent_hints(self):
+        result = _build_instructions("/no/such/path")
+        assert result == srv.INSTRUCTIONS
+
 
 EXPECTED_TOOLS = {
     "connect", "disconnect", "ping", "get_state", "get_message",
@@ -598,6 +690,20 @@ class TestServe:
                 await serve(host, port, protocol, timeout)
         asyncio.run(_inner())
 
+    def _run_serve_real_server(self, **kwargs):
+        """Run serve() without replacing the server object.
+
+        Patches only server.run and stdio_server so that serve() can
+        modify server.instructions on the real Server instance.
+        """
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch.object(srv.server, "run", new=AsyncMock()), \
+                 patch.object(srv.server, "create_initialization_options",
+                              return_value={}):
+                await serve("localhost", 20000, "TCP", 60.0, **kwargs)
+        asyncio.run(_inner())
+
     def test_auto_connect_task_is_created(self):
         """serve() creates a background auto-connect task."""
         with patch("lauterbachdebugger_mcp.server.t32"):
@@ -666,6 +772,46 @@ class TestServe:
                              t32_dir="/custom/t32")
         asyncio.run(_inner())
         assert srv._config["t32_dir"] == "/custom/t32"
+
+    def test_stores_hints_config(self):
+        """serve() must store hints in _config."""
+        self._run_serve()
+        assert srv._config["hints"] is None
+
+    def test_stores_hints_file_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             hints="/my/tips.md")
+        asyncio.run(_inner())
+        assert srv._config["hints"] == "/my/tips.md"
+
+    def test_stores_hints_directory_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             hints="/my/hints-dir")
+        asyncio.run(_inner())
+        assert srv._config["hints"] == "/my/hints-dir"
+
+    def test_hints_embedded_in_instructions(self, tmp_path):
+        hints = tmp_path / "tips.md"
+        hints.write_text("# My Board Tips\nAlways reset before flash.\n")
+        self._run_serve_real_server(hints_file=str(hints))
+        assert "My Board Tips" in srv.server.instructions
+        assert "Always reset before flash" in srv.server.instructions
+
+    def test_instructions_reset_without_hints(self):
+        """Without hints, serve() resets instructions to the static default."""
+        srv.server.instructions = "modified"
+        self._run_serve_real_server()
+        assert srv.server.instructions == srv.INSTRUCTIONS
 
     def test_connect_tool_uses_stored_defaults(self):
         """When connect tool is called with no args, it uses serve() defaults."""

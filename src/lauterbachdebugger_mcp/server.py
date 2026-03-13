@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Optional
 
 import mcp.types as types
@@ -30,9 +32,111 @@ _auto_connect_task: Optional[asyncio.Task] = None
 # Server configuration (set by serve())
 _config: dict[str, Any] = {
     "t32_dir": "~/t32",
+    "hints": None,
 }
 
-server = Server("lauterbachdebugger-mcp")
+# ---------------------------------------------------------------------------
+# MCP server instructions - teaches the LLM TRACE32 concepts
+# ---------------------------------------------------------------------------
+INSTRUCTIONS = """\
+You are connected to a Lauterbach TRACE32 debugger via its Remote API.
+
+## Connection
+This server starts WITHOUT an active TRACE32 connection. You MUST call the
+`connect` tool before using any other tool. The connect tool uses defaults
+from the CLI (host/port) when called without arguments.
+
+## Target States
+The target CPU has four states (returned by `get_state`):
+  0 = stopped/down - target is not accessible
+  1 = running - target is executing code
+  2 = halted - target is stopped at a breakpoint or after a step
+  3 = background_running - target is running with background debug access
+
+IMPORTANT: The target MUST be halted (state 2) to read registers, memory,
+variables, or to step. If state is 1 (running), call `break_` first.
+
+## Address Classes
+TRACE32 uses access class prefixes for addresses:
+  D:0x... = Data access
+  P:0x... = Program access
+  Plain 0x... = Default access class
+Use the appropriate prefix when reading/writing memory.
+
+## Debug Symbols
+Debug symbols must be loaded in TRACE32 for variable/symbol queries to work.
+Load symbols with: run_command("Data.LOAD.ELF <file>") or via a CMM script.
+
+## Common Workflows
+
+### Halt-Inspect-Resume
+1. get_state - check if running
+2. break_ - halt if running
+3. Inspect: read registers, memory, variables, get_context, backtrace
+4. go - resume execution
+
+### After Any Step/Break
+Call `get_context` for a quick situational snapshot (PC, function, source).
+
+### Set Breakpoint by Name
+Use `set_breakpoint_at_symbol` with a function name like "main".
+
+### Read C Strings
+Use `read_string` tool with the string address.
+
+## Useful PRACTICE Functions (for evaluate_function)
+  Register(PC) - read PC register
+  STATE.RUN() - check if target is running (TRUE/FALSE)
+  sYmbol.FUNCTION(addr) - function name at address
+  sYmbol.SOURCEFILE(addr) - source file at address
+  sYmbol.SOURCELINE(addr) - source line at address
+  Var.VALUE(expr) - evaluate C expression
+  Data.STRing(D:addr) - read null-terminated string
+  CPU() - current CPU name
+  CPUFAMILY() - CPU family name
+  SYSTEM.BIGENDIAN() - TRUE if big-endian target
+
+"""
+
+
+def _load_hints(hints_path: str) -> str:
+    """Load user hint content from a file or directory of .md files.
+
+    If *hints_path* is a regular file, its content is returned directly.
+    If it is a directory, all ``*.md`` files found inside (sorted by name)
+    are concatenated and returned.  Returns an empty string when nothing
+    could be loaded.
+    """
+    p = Path(os.path.expanduser(hints_path))
+    parts: list[str] = []
+    if p.is_file():
+        try:
+            parts.append(p.read_text(encoding="utf-8"))
+        except OSError as exc:
+            logger.warning("Failed to read hints file %s: %s", p, exc)
+    elif p.is_dir():
+        for md_file in sorted(p.glob("*.md")):
+            try:
+                parts.append(md_file.read_text(encoding="utf-8"))
+            except OSError as exc:
+                logger.warning("Failed to read hints file %s: %s",
+                               md_file, exc)
+    else:
+        logger.warning("Hints path does not exist: %s", p)
+    return "\n".join(parts)
+
+
+def _build_instructions(hints: Optional[str] = None) -> str:
+    """Return the full server instructions, optionally with user hints."""
+    if not hints:
+        return INSTRUCTIONS
+    hints_content = _load_hints(hints)
+    if not hints_content:
+        return INSTRUCTIONS
+    return INSTRUCTIONS + "\n## User Hints\n\n" + hints_content
+
+
+server = Server("lauterbachdebugger-mcp", instructions=INSTRUCTIONS)
 
 
 def _require_connection() -> t32.Debugger:
@@ -843,6 +947,9 @@ async def serve(
     timeout: float,
     *,
     t32_dir: str = "~/t32",
+    hints: Optional[str] = None,
+    hints_file: Optional[str] = None,
+    hints_dir: Optional[str] = None,
 ) -> None:
     global _auto_connect_task
 
@@ -850,7 +957,19 @@ async def serve(
     _conn_defaults.update(host=host, port=port, protocol=protocol, timeout=timeout)
 
     # Store configuration paths
-    _config.update(t32_dir=t32_dir)
+    _config.update(t32_dir=t32_dir, hints=hints)
+
+    # hints_file / hints_dir kwargs let tests (and future callers) pass a
+    # path directly without going through the unified --hints option.
+    effective_hints: Optional[str] = hints
+    if hints_file is not None:
+        effective_hints = hints_file
+    elif hints_dir is not None:
+        effective_hints = hints_dir
+
+    # Embed user hints into server instructions so the LLM sees them
+    # automatically without needing to fetch the trace32://hints resource.
+    server.instructions = _build_instructions(effective_hints)
 
     logger.info(
         "MCP server starting (auto-connecting to TRACE32 at %s:%s)",
