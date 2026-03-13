@@ -547,9 +547,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return _ok("Ping successful — debugger is reachable.")
 
         elif name == "get_state":
-            state = _require_connection().get_state()
-            if isinstance(state, (bytes, bytearray)):
-                state = int.from_bytes(state, "little")
+            raw_state = _require_connection().get_state()
+            if isinstance(raw_state, (bytes, bytearray)):
+                state = int.from_bytes(raw_state, "little")
+            elif raw_state is not None:
+                state = int(raw_state)
+            else:
+                state = 0
             STATE_NAMES = {0: "stopped", 1: "running", 2: "halted", 3: "background_running"}
             return _ok({"state": state, "state_name": STATE_NAMES.get(state, f"state_{state}")})
 
