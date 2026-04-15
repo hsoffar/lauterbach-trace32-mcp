@@ -24,6 +24,8 @@ from click.testing import CliRunner
 import lauterbachdebugger_mcp.server as srv
 from lauterbachdebugger_mcp import main
 from lauterbachdebugger_mcp.server import (
+    _build_instructions,
+    _error,
     _ok,
     _require_connection,
     call_tool,
@@ -40,8 +42,18 @@ from lauterbachdebugger_mcp.server import (
 def reset_connection():
     """Guarantee a clean (disconnected) state around every test."""
     srv._dbg = None
+    srv._auto_connect_task = None
+    srv._conn_defaults.update(host="localhost", port=20000,
+                              protocol="TCP", timeout=60.0)
+    srv._config.update(t32_dir="~/t32", hints=None)
+    srv.server.instructions = srv.INSTRUCTIONS
     yield
     srv._dbg = None
+    srv._auto_connect_task = None
+    srv._conn_defaults.update(host="localhost", port=20000,
+                              protocol="TCP", timeout=60.0)
+    srv._config.update(t32_dir="~/t32", hints=None)
+    srv.server.instructions = srv.INSTRUCTIONS
 
 
 @pytest.fixture()
@@ -56,6 +68,11 @@ def mock_dbg():
 def run(coro):
     """Run an async coroutine from synchronous test code."""
     return asyncio.run(coro)
+
+
+def _j(result):
+    """Parse JSON from a tool result (list of TextContent)."""
+    return json.loads(result[0].text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +132,8 @@ class TestCLI:
 
     def test_help_lists_all_options(self):
         output = self.runner.invoke(main, ["--help"]).output
-        for opt in ("--host", "--port", "--protocol", "--timeout", "--verbose"):
+        for opt in ("--host", "--port", "--protocol", "--timeout", "--verbose",
+                     "--t32-dir", "--hints"):
             assert opt in output
 
     def test_invalid_protocol_rejected(self):
@@ -125,19 +143,31 @@ class TestCLI:
     def test_default_values_forwarded_to_serve(self):
         received = {}
 
-        async def fake_serve(host, port, protocol, timeout):
-            received.update(host=host, port=port, protocol=protocol, timeout=timeout)
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(host=host, port=port, protocol=protocol,
+                            timeout=timeout, **kwargs)
 
+        # Clear env vars so Click uses coded defaults, not the shell environment
         with patch("lauterbachdebugger_mcp.serve", fake_serve):
-            self.runner.invoke(main, [])
+            self.runner.invoke(main, [], env={
+                "T32_HOST": "",
+                "T32_PORT": "",
+                "T32_PROTOCOL": "",
+                "T32_TIMEOUT": "",
+                "T32SYS": "",
+                "T32_HINTS": "",
+                "T32_CACHE_DIR": "",
+            })
 
         assert received == {"host": "localhost", "port": 20000,
-                            "protocol": "TCP", "timeout": 60.0}
+                            "protocol": "TCP", "timeout": 60.0,
+                            "t32_dir": "~/t32", "hints": None,
+                            "pdf_cache_dir": "~/.cache/lauterbach-t32-mcp"}
 
     def test_custom_host_and_port_forwarded(self):
         received = {}
 
-        async def fake_serve(host, port, protocol, timeout):
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
             received.update(host=host, port=port)
 
         with patch("lauterbachdebugger_mcp.serve", fake_serve):
@@ -145,10 +175,211 @@ class TestCLI:
 
         assert received == {"host": "192.168.1.1", "port": 9999}
 
+    def test_t32_dir_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--t32-dir", "/custom/t32"])
+
+        assert received["t32_dir"] == "/custom/t32"
+
+    def test_hints_file_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--hints", "/my/tips.md"])
+
+        assert received["hints"] == "/my/tips.md"
+
+    def test_hints_directory_forwarded(self):
+        received = {}
+
+        async def fake_serve(host, port, protocol, timeout, **kwargs):
+            received.update(**kwargs)
+
+        with patch("lauterbachdebugger_mcp.serve", fake_serve):
+            self.runner.invoke(main, ["--hints", "/my/hints-dir"])
+
+        assert received["hints"] == "/my/hints-dir"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # list_tools
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server instructions
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestServerInstructions:
+    def test_instructions_are_non_empty(self):
+        assert srv.INSTRUCTIONS
+        assert len(srv.INSTRUCTIONS) > 100
+
+    def test_server_has_instructions(self):
+        assert srv.server.instructions is not None
+        assert len(srv.server.instructions) > 0
+
+    def test_instructions_mention_connect(self):
+        assert "connect" in srv.INSTRUCTIONS.lower()
+
+    def test_instructions_mention_target_states(self):
+        assert "halted" in srv.INSTRUCTIONS
+        assert "running" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_practice_functions(self):
+        assert "Register(PC)" in srv.INSTRUCTIONS
+        assert "sYmbol.FUNCTION" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_address_classes(self):
+        assert "D:0x" in srv.INSTRUCTIONS
+        assert "P:0x" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_enriched_responses(self):
+        assert "Enriched Responses" in srv.INSTRUCTIONS
+        assert "ascii" in srv.INSTRUCTIONS
+        assert "symbol resolution" in srv.INSTRUCTIONS
+
+    def test_instructions_mention_composite_tools(self):
+        assert "Composite" in srv.INSTRUCTIONS
+        assert "get_context" in srv.INSTRUCTIONS
+        assert "backtrace" in srv.INSTRUCTIONS
+        assert "snapshot" in srv.INSTRUCTIONS
+        assert "run_until" in srv.INSTRUCTIONS
+        assert "set_breakpoint_at_symbol" in srv.INSTRUCTIONS
+        assert "read_string" in srv.INSTRUCTIONS
+        assert "dump_memory_formatted" in srv.INSTRUCTIONS
+        assert "disassemble" in srv.INSTRUCTIONS
+        assert "evaluate_expression" in srv.INSTRUCTIONS
+        assert "get_system_info" in srv.INSTRUCTIONS
+        assert "list_functions" in srv.INSTRUCTIONS
+        assert "list_global_variables" in srv.INSTRUCTIONS
+        assert "search_memory" in srv.INSTRUCTIONS
+        assert "write_memory" in srv.INSTRUCTIONS
+        assert "get_source_location" in srv.INSTRUCTIONS
+
+    def test_build_instructions_without_hints(self):
+        result = _build_instructions()
+        assert result == srv.INSTRUCTIONS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResolveSymbolAt:
+    def test_returns_function_and_source_info(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: {
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info == {"function": "main", "source_file": "main.c", "source_line": "42"}
+
+    def test_graceful_on_partial_failure(self):
+        dbg = MagicMock()
+        call_count = [0]
+        def _side_effect(expr):
+            call_count[0] += 1
+            if "FUNCTION" in expr:
+                return "main"
+            raise RuntimeError("no symbols")
+        dbg.fnc.side_effect = _side_effect
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info["function"] == "main"
+        assert info["source_file"] is None
+        assert info["source_line"] is None
+
+    def test_graceful_on_total_failure(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = RuntimeError("no symbols")
+        info = srv._resolve_symbol_at(dbg, "0x1000")
+        assert info == {"function": None, "source_file": None, "source_line": None}
+
+
+class TestGetBriefContext:
+    def test_returns_pc_and_symbol_info(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x1000"
+        assert ctx["function"] == "main"
+        assert ctx["source_file"] == "main.c"
+        assert ctx["source_line"] == "42"
+
+    def test_graceful_when_pc_read_fails(self):
+        dbg = MagicMock()
+        dbg.fnc.side_effect = RuntimeError("not halted")
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] is None
+        assert ctx["function"] is None
+        assert ctx["source_file"] is None
+        assert ctx["source_line"] is None
+
+    def test_graceful_when_symbol_fails_but_pc_works(self):
+        dbg = MagicMock()
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x2000"
+            raise RuntimeError("no symbols")
+        dbg.fnc.side_effect = _side_effect
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x2000"
+        assert ctx["function"] is None
+
+    def test_pc_is_hex_string_when_api_returns_raw_integer(self):
+        """Real T32 API returns a raw integer for Register(PC); must be hex string."""
+        dbg = MagicMock()
+        dbg.fnc.side_effect = lambda expr: 4096 if expr == "Register(PC)" else None
+        ctx = srv._get_brief_context(dbg)
+        assert ctx["pc"] == "0x1000"
+
+
+class TestFormatHexDump:
+    def test_single_line(self):
+        data = bytes(range(16))
+        dump = srv._format_hex_dump(data, 0x1000)
+        assert "00000000" not in dump  # base is 0x1000
+        assert "00001000" in dump
+        assert "00 01 02" in dump
+        # ASCII portion
+        assert "|" in dump
+
+    def test_multiple_lines(self):
+        data = bytes(range(32))
+        dump = srv._format_hex_dump(data, 0)
+        lines = dump.strip().split("\n")
+        assert len(lines) == 2
+
+    def test_partial_last_line(self):
+        data = bytes(range(20))
+        dump = srv._format_hex_dump(data, 0)
+        lines = dump.strip().split("\n")
+        assert len(lines) == 2
+
+    def test_non_printable_shown_as_dot(self):
+        data = bytes([0x00, 0x7F, 0xFF, 0x41])  # non-printable + 'A'
+        dump = srv._format_hex_dump(data, 0)
+        assert "A" in dump
+        assert "." in dump
+
+    def test_empty_data(self):
+        dump = srv._format_hex_dump(b"", 0)
+        assert dump == ""
+
 
 EXPECTED_TOOLS = {
     "connect", "disconnect", "ping", "get_state", "get_message",
@@ -161,6 +392,15 @@ EXPECTED_TOOLS = {
     "read_variable", "write_variable",
     "query_symbol_by_name", "query_symbol_by_address",
     "get_practice_macro", "set_practice_macro",
+    # Composite tools
+    "get_context", "get_source_location", "evaluate_expression",
+    "get_system_info", "read_string", "dump_memory_formatted",
+    "write_memory", "backtrace", "disassemble",
+    "set_breakpoint_at_symbol", "run_until", "snapshot",
+    "list_functions", "list_global_variables", "search_memory",
+    # Documentation, PER files
+    "list_trace32_docs", "search_trace32_docs",
+    "list_per_files", "load_per_file", "per_read_register",
 }
 
 
@@ -203,17 +443,20 @@ class TestConnectionTools:
                 "node": "192.168.0.1", "port": 10000, "protocol": "UDP", "timeout": 5.0
             }))
         mock_t32.connect.assert_called_once_with(
-            node="192.168.0.1", port=10000, protocol="UDP", timeout=5.0
+            node="192.168.0.1", port="10000", protocol="UDP", timeout=5.0
         )
         assert "Connected" in result[0].text
         assert srv._dbg is mock_conn
 
     def test_connect_uses_defaults_when_no_args(self):
+        # Reset to known defaults
+        srv._conn_defaults.update(host="localhost", port=20000,
+                                  protocol="TCP", timeout=60.0)
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
             mock_t32.connect.return_value = MagicMock()
             run(call_tool("connect", {}))
         mock_t32.connect.assert_called_once_with(
-            node="localhost", port=20000, protocol="TCP", timeout=60.0
+            node="localhost", port="20000", protocol="TCP", timeout=60.0
         )
 
     def test_connect_disconnects_existing_session(self, mock_dbg):
@@ -237,9 +480,12 @@ class TestConnectionTools:
         mock_dbg.ping.assert_called_once()
         assert "Ping successful" in result[0].text
 
-    def test_ping_not_connected_returns_error_text(self):
-        result = run(call_tool("ping", {}))
-        assert "Error" in result[0].text
+    def test_ping_not_connected_raises_structured_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("ping", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "connect" in data["suggestion"].lower()
 
     def test_get_state_integer_value(self, mock_dbg):
         mock_dbg.get_state.return_value = 2
@@ -268,24 +514,82 @@ class TestConnectionTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestExecutionTools:
-    @pytest.mark.parametrize("tool,method,fragment", [
-        ("go",        "go",        "Go"),
-        ("break_",    "break_",    "Break"),
-        ("step",      "step",      "step"),
-        ("step_asm",  "step_asm",  "Assembly"),
-        ("step_hll",  "step_hll",  "HLL"),
-        ("step_over", "step_over", "Step.Over"),
-        ("go_up",     "go_up",     "Go.Up"),
-        ("go_return", "go_return", "Go.Return"),
-    ])
-    def test_execution_tool(self, tool, method, fragment, mock_dbg):
-        result = run(call_tool(tool, {}))
-        getattr(mock_dbg, method).assert_called_once()
-        assert fragment in result[0].text
-
-    def test_not_connected_returns_error_not_raises(self):
+    def test_go_returns_running_status(self, mock_dbg):
         result = run(call_tool("go", {}))
-        assert "Error" in result[0].text
+        mock_dbg.go.assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == "go"
+        assert data["status"] == "running"
+
+    def test_break_returns_context_with_symbols(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }.get(expr, "")
+        result = run(call_tool("break_", {}))
+        mock_dbg.break_.assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == "break"
+        assert data["status"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["function"] == "main"
+
+    def test_break_returns_context_without_symbols(self, mock_dbg):
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x1000"
+            raise RuntimeError("no symbols loaded")
+        mock_dbg.fnc.side_effect = _side_effect
+        result = run(call_tool("break_", {}))
+        data = json.loads(result[0].text)
+        assert data["action"] == "break"
+        assert data["status"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["function"] is None
+        assert data["source_file"] is None
+        assert data["source_line"] is None
+
+    @pytest.mark.parametrize("tool", [
+        "step", "step_asm", "step_hll", "step_over", "go_up", "go_return",
+    ])
+    def test_step_tools_return_context_with_symbols(self, tool, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x2000",
+            "sYmbol.FUNCTION(D:0x2000)": "handler",
+            "sYmbol.SOURCEFILE(D:0x2000)": "irq.c",
+            "sYmbol.SOURCELINE(D:0x2000)": "10",
+        }.get(expr, "")
+        result = run(call_tool(tool, {}))
+        getattr(mock_dbg, tool).assert_called_once()
+        data = json.loads(result[0].text)
+        assert data["action"] == tool
+        assert data["status"] == "completed"
+        assert data["pc"] == "0x2000"
+        assert data["function"] == "handler"
+
+    @pytest.mark.parametrize("tool", [
+        "step", "step_asm", "step_hll", "step_over", "go_up", "go_return",
+    ])
+    def test_step_tools_return_context_without_symbols(self, tool, mock_dbg):
+        def _side_effect(expr):
+            if expr == "Register(PC)":
+                return "0x2000"
+            raise RuntimeError("no symbols loaded")
+        mock_dbg.fnc.side_effect = _side_effect
+        result = run(call_tool(tool, {}))
+        data = json.loads(result[0].text)
+        assert data["action"] == tool
+        assert data["status"] == "completed"
+        assert data["pc"] == "0x2000"
+        assert data["function"] is None
+
+    def test_not_connected_raises_structured_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,12 +622,13 @@ class TestPracticeTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMemoryTools:
-    def test_read_memory_returns_hex_and_bytes(self, mock_dbg):
-        mock_dbg.memory.read.return_value = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    def test_read_memory_returns_hex_bytes_and_ascii(self, mock_dbg):
+        mock_dbg.memory.read.return_value = bytes([0xDE, 0xAD, 0x42, 0xEF])
         data = json.loads(run(call_tool("read_memory", {"address": "0x20000000", "length": 4}))[0].text)
-        assert data["hex"] == "deadbeef"
+        assert data["hex"] == "dead42ef"
         assert data["length"] == 4
-        assert data["bytes"] == [0xDE, 0xAD, 0xBE, 0xEF]
+        assert data["bytes"] == [0xDE, 0xAD, 0x42, 0xEF]
+        assert data["ascii"] == "..B."  # 0xDE, 0xAD non-printable; 0x42='B'; 0xEF non-printable
 
     @pytest.mark.parametrize("dtype,method", [
         ("uint8",  "read_uint8"),
@@ -410,18 +715,28 @@ class TestRegisterTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestBreakpointTools:
-    def test_set_breakpoint_default_type_and_impl(self, mock_dbg):
+    def test_set_breakpoint_returns_enriched_info(self, mock_dbg):
         mock_dbg.breakpoint.set.return_value = MagicMock(__str__=lambda s: "BP@0x1000")
+        mock_dbg.fnc.return_value = "main"
         result = run(call_tool("set_breakpoint", {"address": "0x08000100"}))
         assert mock_dbg.breakpoint.set.called
-        assert "BP@0x1000" in result[0].text
+        data = json.loads(result[0].text)
+        assert data["breakpoint"] == "BP@0x1000"
+        assert data["address"] == "0x08000100"
+        assert data["type"] == "PROGRAM"
+        assert data["impl"] == "AUTO"
 
-    def test_list_breakpoints_returns_all(self, mock_dbg):
-        mock_dbg.breakpoint.list.return_value = [
-            MagicMock(__str__=lambda s: f"BP{i}") for i in range(3)
-        ]
+    def test_list_breakpoints_returns_enriched_list(self, mock_dbg):
+        bp_mocks = []
+        for i in range(3):
+            bp = MagicMock(__str__=lambda s, n=i: f"BP{n}")
+            bp.address = MagicMock(__str__=lambda s, n=i: f"0x{n}000")
+            bp_mocks.append(bp)
+        mock_dbg.breakpoint.list.return_value = bp_mocks
+        mock_dbg.fnc.return_value = None
         data = json.loads(run(call_tool("list_breakpoints", {}))[0].text)
         assert len(data) == 3
+        assert "breakpoint" in data[0]
 
     def test_delete_breakpoint(self, mock_dbg):
         mock_bp = MagicMock()
@@ -524,29 +839,953 @@ class TestMacroTools:
 # call_tool — error handling
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestErrorHelper:
+    """Tests for the _error() helper function."""
+
+    def test_error_raises_value_error(self):
+        with pytest.raises(ValueError):
+            _error(RuntimeError("something failed"))
+
+    def test_error_message_is_json(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("something failed"))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert data["message"] == "something failed"
+
+    def test_error_includes_suggestion_when_given(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("fail"), suggestion="Try this instead.")
+        data = json.loads(str(exc_info.value))
+        assert data["suggestion"] == "Try this instead."
+
+    def test_error_no_suggestion_when_omitted(self):
+        with pytest.raises(ValueError) as exc_info:
+            _error(RuntimeError("fail"))
+        data = json.loads(str(exc_info.value))
+        assert "suggestion" not in data
+
+
 class TestErrorHandling:
     def test_unknown_tool_name(self, mock_dbg):
         result = run(call_tool("nonexistent_tool", {}))
         assert "Unknown tool" in result[0].text
 
-    def test_debugger_exception_becomes_text_not_raises(self, mock_dbg):
+    def test_debugger_exception_raises_with_structured_json(self, mock_dbg):
         mock_dbg.go.side_effect = RuntimeError("hardware fault")
-        result = run(call_tool("go", {}))
-        assert "Error" in result[0].text
-        assert "hardware fault" in result[0].text
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "hardware fault" in data["message"]
 
-    def test_exception_result_is_text_content(self, mock_dbg):
+    def test_generic_exception_raises_with_error_type(self, mock_dbg):
         mock_dbg.step.side_effect = Exception("boom")
-        result = run(call_tool("step", {}))
-        assert result[0].type == "text"
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("step", {}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "Exception"
+        assert "boom" in data["message"]
 
-    def test_not_connected_error_names_the_connect_tool(self):
-        result = run(call_tool("read_register", {"name": "PC"}))
-        assert "connect" in result[0].text
+    def test_not_connected_error_suggests_connect(self):
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_register", {"name": "PC"}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+        assert "connect" in data["suggestion"].lower()
+
+
+class TestStructuredErrors:
+    """Tests for typed pyrcl exception handling with suggestions."""
+
+    def _assert_error(self, exc_info, expected_error, suggestion_fragment):
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == expected_error
+        assert "suggestion" in data
+        assert suggestion_fragment.lower() in data["suggestion"].lower()
+
+    def test_api_connection_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32ApiConnectionError
+        mock_dbg.go.side_effect = T32ApiConnectionError("connection lost")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("go", {}))
+        self._assert_error(exc_info, "ApiConnectionError", "connect")
+
+    def test_command_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32CommandError
+        mock_dbg.cmd.side_effect = T32CommandError("bad command")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("run_command", {"command": "BAD"}))
+        self._assert_error(exc_info, "CommandError", "syntax")
+
+    def test_function_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32FunctionError
+        mock_dbg.fnc.side_effect = T32FunctionError("no such function")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("evaluate_function", {"function": "BAD()"}))
+        self._assert_error(exc_info, "FunctionError", "halted")
+
+    def test_memory_read_access_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32MemoryReadAccessError
+        mock_dbg.memory.read.side_effect = T32MemoryReadAccessError("access denied")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_memory", {"address": "0x0", "length": 4}))
+        self._assert_error(exc_info, "MemoryReadAccessError", "halt")
+
+    def test_memory_write_access_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32MemoryWriteAccessError
+        mock_dbg.memory.write_uint32.side_effect = T32MemoryWriteAccessError("read-only")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("write_memory_typed", {
+                "address": "0x0", "type": "uint32", "value": 0
+            }))
+        self._assert_error(exc_info, "MemoryWriteAccessError", "read-only")
+
+    def test_variable_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32VariableError
+        mock_dbg.variable.read.side_effect = T32VariableError("no symbols")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_variable", {"name": "myVar"}))
+        self._assert_error(exc_info, "VariableError", "debug symbols")
+
+    def test_symbol_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32SymbolError
+        mock_dbg.symbol.query_by_name.side_effect = T32SymbolError("unknown symbol")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("query_symbol_by_name", {"name": "missing"}))
+        self._assert_error(exc_info, "SymbolError", "debug symbols")
+
+    def test_register_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32RegisterError
+        mock_dbg.register.read.side_effect = T32RegisterError("invalid register")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("read_register", {"name": "BADREG"}))
+        self._assert_error(exc_info, "RegisterError", "halt")
+
+    def test_breakpoint_error(self, mock_dbg):
+        from lauterbachdebugger_mcp.server import T32BreakpointError
+        mock_dbg.breakpoint.set.side_effect = T32BreakpointError("bp failed")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("set_breakpoint", {"address": "0x1000"}))
+        self._assert_error(exc_info, "BreakpointError", "breakpoint")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# call_tool — composite tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetContext:
+    def test_returns_full_context(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x1000",
+            "Register(SP)": "0x2000",
+            "Register(LR)": "0x3000",
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+            "CPU()": "CortexM4",
+        }[expr]
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["state"] == 2
+        assert data["state_name"] == "halted"
+        assert data["pc"] == "0x1000"
+        assert data["sp"] == "0x2000"
+        assert data["lr"] == "0x3000"
+        assert data["function"] == "main"
+        assert data["cpu"] == "CortexM4"
+
+    def test_graceful_degradation(self, mock_dbg):
+        mock_dbg.get_state.side_effect = RuntimeError("fail")
+        mock_dbg.fnc.side_effect = RuntimeError("fail")
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["state"] is None
+        assert data["pc"] is None
+        assert data["function"] is None
+
+    def test_registers_returned_as_hex_strings(self, mock_dbg):
+        """Real T32 API returns raw integers for Register(); must be hex strings."""
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": 4096,
+            "Register(SP)": 8192,
+            "Register(LR)": 12288,
+            "CPU()": "CortexM4",
+        }.get(expr)
+        data = json.loads(run(call_tool("get_context", {}))[0].text)
+        assert data["pc"] == "0x1000"
+        assert data["sp"] == "0x2000"
+        assert data["lr"] == "0x3000"
+
+
+class TestGetSourceLocation:
+    def test_with_explicit_address(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "sYmbol.FUNCTION(D:0x1000)": "main",
+            "sYmbol.SOURCEFILE(D:0x1000)": "main.c",
+            "sYmbol.SOURCELINE(D:0x1000)": "42",
+        }[expr]
+        data = json.loads(run(call_tool("get_source_location", {"address": "0x1000"}))[0].text)
+        assert data["address"] == "0x1000"
+        assert data["function"] == "main"
+
+    def test_defaults_to_pc(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Register(PC)": "0x2000",
+            "sYmbol.FUNCTION(D:0x2000)": "foo",
+            "sYmbol.SOURCEFILE(D:0x2000)": "foo.c",
+            "sYmbol.SOURCELINE(D:0x2000)": "10",
+        }[expr]
+        data = json.loads(run(call_tool("get_source_location", {}))[ 0].text)
+        assert data["address"] == "0x2000"
+        assert data["function"] == "foo"
+
+    def test_pc_address_is_hex_string_when_api_returns_raw_integer(self, mock_dbg):
+        """Real T32 API returns raw integer for Register(PC); address must be hex."""
+        mock_dbg.fnc.side_effect = lambda expr: (
+            4096 if expr == "Register(PC)" else None
+        )
+        data = json.loads(run(call_tool("get_source_location", {}))[0].text)
+        assert data["address"] == "0x1000"
+
+
+class TestEvaluateExpression:
+    def test_decimal_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.VALUE(myVar)": "42",
+            "Var.TYPEOF(myVar)": "int",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {"expression": "myVar"}))[0].text)
+        assert data["expression"] == "myVar"
+        assert data["value"] == "42"
+        assert data["type"] == "int"
+
+    def test_hex_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.VALUE(myVar)": "255",
+            "Var.TYPEOF(myVar)": "unsigned int",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {
+            "expression": "myVar", "format": "hex"
+        }))[0].text)
+        assert data["hex"] == "0xff"
+
+    def test_string_format(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "Var.STRing(myStr)": "hello",
+            "Var.TYPEOF(myStr)": "char *",
+        }[expr]
+        data = json.loads(run(call_tool("evaluate_expression", {
+            "expression": "myStr", "format": "string"
+        }))[0].text)
+        assert data["value"] == "hello"
+
+    def test_graceful_on_failure(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("evaluate_expression", {"expression": "bad"}))[0].text)
+        assert data["value"] is None
+        assert data["type"] is None
+
+
+class TestGetSystemInfo:
+    def test_returns_system_info(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: {
+            "CPU()": "CortexM4",
+            "CPUFAMILY()": "ARM",
+            "SYSTEM.BIGENDIAN()": "FALSE",
+        }[expr]
+        data = json.loads(run(call_tool("get_system_info", {}))[0].text)
+        assert data["cpu"] == "CortexM4"
+        assert data["cpu_family"] == "ARM"
+        assert data["big_endian"] == "FALSE"
+
+    def test_graceful_on_failure(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("fail")
+        data = json.loads(run(call_tool("get_system_info", {}))[0].text)
+        assert data["cpu"] is None
+
+
+class TestReadString:
+    def test_reads_string(self, mock_dbg):
+        mock_dbg.fnc.return_value = "Hello World"
+        data = json.loads(run(call_tool("read_string", {"address": "0x1000"}))[0].text)
+        assert data["string"] == "Hello World"
+        assert data["length"] == 11
+        mock_dbg.fnc.assert_called_once_with("Data.STRing(D:0x1000)")
+
+    def test_truncates_at_max_length(self, mock_dbg):
+        mock_dbg.fnc.return_value = "A" * 500
+        data = json.loads(run(call_tool("read_string", {
+            "address": "0x1000", "max_length": 10
+        }))[0].text)
+        assert data["length"] == 10
+
+    def test_unicode_decode_error_returns_structured_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = UnicodeDecodeError(
+            "utf-8", b"\xff\xfe", 0, 1, "invalid start byte"
+        )
+        data = json.loads(run(call_tool("read_string", {"address": "0x2000"}))[0].text)
+        assert data["string"] is None
+        assert data["length"] == 0
+        assert "error" in data
+        assert "UTF-8" in data["error"]
+
+
+class TestDumpMemoryFormatted:
+    def test_returns_hex_dump(self, mock_dbg):
+        mock_dbg.memory.read.return_value = bytes(range(32))
+        data = json.loads(run(call_tool("dump_memory_formatted", {
+            "address": "0x1000", "length": 32
+        }))[0].text)
+        assert data["length"] == 32
+        assert "00001000" in data["dump"]
+        assert data["raw_hex"] == bytes(range(32)).hex()
+
+
+class TestWriteMemory:
+    def test_writes_bytes(self, mock_dbg):
+        data = json.loads(run(call_tool("write_memory", {
+            "address": "0x2000", "data": "DEADBEEF"
+        }))[0].text)
+        assert data["length"] == 4
+        assert data["data_written"] == "DEADBEEF"
+        mock_dbg.memory.write.assert_called_once()
+        written_bytes = mock_dbg.memory.write.call_args[0][1]
+        assert written_bytes == b"\xDE\xAD\xBE\xEF"
+
+
+class TestBacktrace:
+    def test_returns_frames(self, mock_dbg):
+        pc_call_count = [0]
+        frame_pcs = ["0x1000", "0x500"]
+
+        def _fnc(expr):
+            if expr == "Register(PC)":
+                i = pc_call_count[0]
+                pc_call_count[0] += 1
+                if i < len(frame_pcs):
+                    return frame_pcs[i]
+                raise RuntimeError("no more frames")
+            if "sYmbol.FUNCTION" in expr:
+                return "main" if "0x1000" in expr else "startup"
+            if "sYmbol.SOURCEFILE" in expr:
+                return "main.c" if "0x1000" in expr else "startup.c"
+            if "sYmbol.SOURCELINE" in expr:
+                return "42" if "0x1000" in expr else "10"
+            return ""
+
+        cmd_up_count = [0]
+
+        def _cmd(cmd_str):
+            if cmd_str == "Frame.Up":
+                cmd_up_count[0] += 1
+                if cmd_up_count[0] >= 2:
+                    raise RuntimeError("top of stack")
+
+        mock_dbg.fnc.side_effect = _fnc
+        mock_dbg.cmd.side_effect = _cmd
+        data = json.loads(run(call_tool("backtrace", {"depth": 20}))[0].text)
+        assert data["depth"] == 2
+        assert data["frames"][0]["function"] == "main"
+        assert data["frames"][1]["function"] == "startup"
+        assert not data["truncated"]
+
+    def test_empty_backtrace(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no frames")
+        data = json.loads(run(call_tool("backtrace", {}))[0].text)
+        assert data["depth"] == 0
+        assert data["frames"] == []
+
+    def test_truncation_flag(self, mock_dbg):
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("backtrace", {"depth": 2}))[0].text)
+        assert data["truncated"]
+        assert data["depth"] == 2
+
+
+class TestDisassemble:
+    def test_disassemble_from_pc(self, mock_dbg):
+        mock_dbg.fnc.side_effect = lambda expr: "0x1000" if expr == "Register(PC)" else "ARM"
+        mock_dbg.memory.read.return_value = b"\x00" * 8
+        data = json.loads(run(call_tool("disassemble", {"count": 2}))[0].text)
+        assert data["start_address"] == "0x1000"
+        assert len(data["instructions"]) == 2
+        assert data["instructions"][0]["address"] == "0x1000"
+        assert data["instructions"][1]["address"] == "0x1004"
+        assert "note" in data
+
+    def test_disassemble_memory_error(self, mock_dbg):
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.memory.read.side_effect = RuntimeError("read failed")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("disassemble", {"count": 10}))
+        data = json.loads(str(exc_info.value))
+        assert data["error"] == "RuntimeError"
+
+    def test_disassemble_pc_fallback_when_target_not_halted(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("target not halted")
+        mock_dbg.memory.read.return_value = b"\x00" * 8
+        data = json.loads(run(call_tool("disassemble", {"count": 2}))[0].text)
+        assert data["start_address"] == "0x0"
+        assert data["pc_fallback"] is True
+        assert "warning" in data
+
+
+class TestSetBreakpointAtSymbol:
+    def test_sets_breakpoint_by_name(self, mock_dbg):
+        sym = MagicMock()
+        sym.address = MagicMock(__str__=lambda s: "0x1000")
+        mock_dbg.symbol.query_by_name.return_value = sym
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "main"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Break.Set main /PROGRAM /AUTO")
+        assert data["symbol"] == "main"
+        assert data["address"] == "0x1000"
+        assert data["enabled"]
+
+    def test_custom_type_and_impl(self, mock_dbg):
+        mock_dbg.symbol.query_by_name.side_effect = RuntimeError("no sym")
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "foo", "type": "WRITE", "impl": "ONCHIP"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Break.Set foo /WRITE /ONCHIP")
+        assert data["address"] is None
+
+    def test_symbol_not_found_suggests_loading_elf(self, mock_dbg):
+        # T32CommandError is the real exception type raised by the T32 API
+        from lauterbachdebugger_mcp.server import T32CommandError
+        mock_dbg.cmd.side_effect = T32CommandError("symbol not found")
+        with pytest.raises(ValueError) as exc_info:
+            run(call_tool("set_breakpoint_at_symbol", {"symbol": "main"}))
+        data = json.loads(str(exc_info.value))
+        assert "suggestion" in data
+        assert "Data.LOAD.ELF" in data["suggestion"]
+
+
+class TestRunUntil:
+    def test_reaches_target(self, mock_dbg):
+        # Simulate: first poll returns running (1), second returns halted (2)
+        poll_count = [0]
+        def _get_state():
+            poll_count[0] += 1
+            return 2 if poll_count[0] >= 2 else 1
+        mock_dbg.get_state.side_effect = _get_state
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Go.direct main")
+        assert data["reached"]
+        assert "pc" in data
+
+    def test_timeout(self, mock_dbg):
+        mock_dbg.get_state.return_value = 1  # always running
+        mock_dbg.fnc.return_value = "0x1000"
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 0.2
+        }))[0].text)
+        assert not data["reached"]
+        assert data["status"] == "timeout"
+
+    def test_pc_returned_as_hex_string(self, mock_dbg):
+        """PC from _get_brief_context must be a '0x...' string, not a raw integer."""
+        mock_dbg.get_state.side_effect = [1, 2]
+        # Real T32 API returns a raw integer for Register(PC)
+        mock_dbg.fnc.return_value = 4096
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        assert data["reached"]
+        assert data["pc"] == "0x1000"
+
+    def test_falls_back_to_go_when_go_direct_fails(self, mock_dbg):
+        """If Go.direct raises (e.g. multi-core SoC), fall back to plain Go."""
+        poll_count = [0]
+        def _get_state():
+            poll_count[0] += 1
+            return 2 if poll_count[0] >= 2 else 1
+        mock_dbg.get_state.side_effect = _get_state
+        mock_dbg.fnc.return_value = "0x1000"
+        def _cmd(cmd_str):
+            if cmd_str.startswith("Go.direct"):
+                raise RuntimeError("target system down")
+        mock_dbg.cmd.side_effect = _cmd
+        data = json.loads(run(call_tool("run_until", {
+            "target": "main", "timeout": 5.0
+        }))[0].text)
+        assert data["reached"]
+        calls = [c.args[0] for c in mock_dbg.cmd.call_args_list]
+        assert any(c.startswith("Go.direct") for c in calls)
+        assert "Go" in calls
+
+
+class TestSnapshot:
+    def test_returns_full_snapshot(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.breakpoint.list.return_value = []
+        data = json.loads(run(call_tool("snapshot", {}))[0].text)
+        assert "context" in data
+        assert "backtrace" in data
+        assert "breakpoints" in data
+        assert "system_info" in data
+        assert "registers" not in data  # not requested
+
+    def test_includes_registers_when_requested(self, mock_dbg):
+        mock_dbg.get_state.return_value = 2
+        mock_dbg.fnc.return_value = "0x1000"
+        mock_dbg.breakpoint.list.return_value = []
+        mock_dbg.register.read_all.return_value = [
+            MagicMock(to_dict=lambda: {"name": "R0", "value": 0})
+        ]
+        data = json.loads(run(call_tool("snapshot", {"include_registers": True}))[0].text)
+        assert "registers" in data
+
+
+class TestListFunctions:
+    def test_returns_count(self, mock_dbg):
+        mock_dbg.fnc.return_value = "5"
+        data = json.loads(run(call_tool("list_functions", {"filter": "my_*"}))[0].text)
+        assert data["count"] == 5
+        assert data["filter"] == "my_*"
+        assert data["items"] == []
+        assert "note" in data
+        mock_dbg.fnc.assert_called_with("sYmbol.COUNT(my_*)")
+
+    def test_count_zero_on_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("list_functions", {}))[0].text)
+        assert data["count"] == 0
+        assert data["items"] == []
+
+
+class TestListGlobalVariables:
+    def test_returns_count(self, mock_dbg):
+        mock_dbg.fnc.return_value = "3"
+        data = json.loads(run(call_tool("list_global_variables", {"filter": "g_*"}))[0].text)
+        assert data["count"] == 3
+        assert data["filter"] == "g_*"
+        assert data["items"] == []
+        assert "note" in data
+        mock_dbg.fnc.assert_called_with("sYmbol.COUNT(g_*)")
+
+    def test_count_zero_on_error(self, mock_dbg):
+        mock_dbg.fnc.side_effect = RuntimeError("no symbols")
+        data = json.loads(run(call_tool("list_global_variables", {}))[0].text)
+        assert data["count"] == 0
+
+
+class TestSearchMemory:
+    def test_finds_pattern(self, mock_dbg):
+        # Memory contains the pattern at offset 8
+        mem = b"\x00" * 8 + b"\xDE\xAD\xBE\xEF" + b"\x00" * 20
+        mock_dbg.memory.read.return_value = mem
+        data = json.loads(run(call_tool("search_memory", {
+            "start_address": "0x0", "end_address": "0x20",
+            "pattern": "DEADBEEF",
+        }))[0].text)
+        assert data["found"]
+        assert data["address"] == "0x8"
+
+    def test_pattern_not_found(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\x00" * 32
+        data = json.loads(run(call_tool("search_memory", {
+            "start_address": "0x0", "end_address": "0x20",
+            "pattern": "DEADBEEF",
+        }))[0].text)
+        assert not data["found"]
+        assert data["address"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # serve() — auto-connect behaviour
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Documentation tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestListTraceDocs:
+    def test_list_docs_empty(self, tmp_path):
+        """Returns empty list when pdf dir does not exist."""
+        srv._config["t32_dir"] = str(tmp_path / "nonexistent")
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        assert result["docs"] == []
+        assert result["total"] == 0
+
+    def test_list_docs_finds_pdfs(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"fake pdf")
+        (pdf_dir / "practice_ref.pdf").write_bytes(b"fake pdf 2")
+        (pdf_dir / "readme.txt").write_text("not a pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        assert result["total"] == 2
+        names = [d["name"] for d in result["docs"]]
+        assert "debugger_arm.pdf" in names
+        assert "practice_ref.pdf" in names
+
+    def test_list_docs_category_filter(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        (pdf_dir / "rtos_linux.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {"category": "debugger"})))
+        assert result["total"] == 1
+        assert result["docs"][0]["name"] == "debugger_arm.pdf"
+
+
+class TestSearchTraceDocs:
+    def test_search_finds_match(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        (pdf_dir / "practice_ref.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("search_trace32_docs", {"query": "arm"})))
+        assert result["total"] == 1
+        assert result["results"][0]["name"] == "debugger_arm.pdf"
+
+    def test_search_no_match(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("search_trace32_docs", {"query": "zzzzz"})))
+        assert result["total"] == 0
+
+    def test_scan_pdf_docs_has_pdf_path(self, tmp_path):
+        """_scan_pdf_docs returns pdf_path (not path) in each entry."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"pdf")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_trace32_docs", {})))
+        doc = result["docs"][0]
+        assert "pdf_path" in doc
+        assert doc["pdf_path"].endswith("debugger_arm.pdf")
+        assert "path" not in doc  # old key removed
+
+    def test_search_uses_cached_txt(self, tmp_path):
+        """search_trace32_docs returns snippets from cached .txt files."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        pdf_file = pdf_dir / "practice_ref.pdf"
+        pdf_file.write_bytes(b"fake pdf content")
+        # Pre-populate a fake cache entry in a temp dir.
+        cache_dir = tmp_path / "pdf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        srv._config["pdf_cache_dir"] = str(cache_dir)
+        txt_file = cache_dir / "practice_ref.txt"
+        txt_file.write_text(
+            "Line before\nsYmbol.LIST.FUNCTION filter example\nLine after\n"
+        )
+        md5_file = cache_dir / "practice_ref.md5"
+        import hashlib
+        h = hashlib.md5(b"fake pdf content").hexdigest()
+        md5_file.write_text(h + "\n")
+        # Mark as verified so the test doesn't re-hash.
+        pdf_key = str(pdf_file.resolve())
+        srv._pdf_cache_verified.add(pdf_key)
+        srv._config["t32_dir"] = str(tmp_path)
+        try:
+            result = _j(run(call_tool("search_trace32_docs",
+                                      {"query": "sYmbol.LIST"})))
+            assert result["total"] == 1
+            doc = result["results"][0]
+            assert "snippets" in doc
+            assert any("sYmbol.LIST.FUNCTION" in s for s in doc["snippets"])
+            assert doc["txt_path"] is not None
+            assert doc["pdf_path"].endswith("practice_ref.pdf")
+        finally:
+            srv._pdf_cache_verified.discard(pdf_key)
+            srv._config["pdf_cache_dir"] = "~/.cache/lauterbach-t32-mcp"
+
+    def test_search_extracts_uncached_pdf(self, tmp_path):
+        """search_trace32_docs extracts PDFs on demand when not yet cached."""
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        pdf_file = pdf_dir / "practice_ref.pdf"
+        pdf_file.write_bytes(b"fake pdf content")
+        cache_dir = tmp_path / "pdf-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        srv._config["t32_dir"] = str(tmp_path)
+        srv._config["pdf_cache_dir"] = str(cache_dir)
+        fake_text = "Line before\nsYmbol.LIST.FUNCTION filter example\nLine after\n"
+        try:
+            with patch.object(
+                srv, "_get_or_cache_pdf_text", return_value=fake_text
+            ):
+                result = _j(run(call_tool("search_trace32_docs",
+                                          {"query": "sYmbol.LIST"})))
+            assert result["total"] == 1
+            doc = result["results"][0]
+            assert "snippets" in doc
+            assert any("sYmbol.LIST.FUNCTION" in s for s in doc["snippets"])
+        finally:
+            srv._config["pdf_cache_dir"] = "~/.cache/lauterbach-t32-mcp"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF text cache helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPdfCache:
+    def test_pdf_md5_consistent(self, tmp_path):
+        """_pdf_md5 returns the same hex digest for identical content."""
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"hello world")
+        d1 = srv._pdf_md5(f)
+        d2 = srv._pdf_md5(f)
+        assert d1 == d2
+        assert len(d1) == 32
+
+    def test_pdf_md5_differs_on_change(self, tmp_path):
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"version1")
+        d1 = srv._pdf_md5(f)
+        f.write_bytes(b"version2")
+        d2 = srv._pdf_md5(f)
+        assert d1 != d2
+
+    def test_get_pdf_cache_dir_no_pdftotext(self, tmp_path):
+        """Returns None when pdftotext is not available."""
+        with patch("shutil.which", return_value=None):
+            result = srv._get_pdf_cache_dir()
+        assert result is None
+
+    def test_get_pdf_cache_dir_creates_dir(self, tmp_path, monkeypatch):
+        """Returns the cache directory and creates it on first call."""
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(tmp_path / "pdf-cache"))
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+            result = srv._get_pdf_cache_dir()
+        assert result is not None
+        assert result.is_dir()
+
+    def test_cache_miss_no_pdftotext(self, tmp_path):
+        """Returns None when pdftotext is absent."""
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"content")
+        with patch("shutil.which", return_value=None):
+            result = srv._get_or_cache_pdf_text(pdf)
+        assert result is None
+
+    def test_cache_hit_session_verified(self, tmp_path, monkeypatch):
+        """Fast path: returns cached text without re-hashing when already
+        verified in this session."""
+        import hashlib
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(cache_dir))
+
+        pdf = tmp_path / "doc.pdf"
+        content = b"pdf bytes"
+        pdf.write_bytes(content)
+
+        txt = cache_dir / "doc.txt"
+        txt.write_text("extracted text")
+        (cache_dir / "doc.md5").write_text(
+            hashlib.md5(content).hexdigest() + "\n"
+        )
+        pdf_key = str(pdf.resolve())
+        srv._pdf_cache_verified.add(pdf_key)
+        try:
+            with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+                result = srv._get_or_cache_pdf_text(pdf)
+            assert result == "extracted text"
+        finally:
+            srv._pdf_cache_verified.discard(pdf_key)
+
+    def test_cache_regenerated_on_md5_change(self, tmp_path, monkeypatch):
+        """Cache is regenerated when the PDF changes (MD5 mismatch)."""
+        import hashlib
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        monkeypatch.setitem(srv._config, "pdf_cache_dir", str(cache_dir))
+
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"new content")
+        txt = cache_dir / "doc.txt"
+        (cache_dir / "doc.md5").write_text(
+            hashlib.md5(b"old content").hexdigest() + "\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            # Simulate pdftotext writing the .tmp output file.
+            out = cmd[2]  # third arg is the output path
+            from pathlib import Path
+            Path(out).write_text("fresh text")
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        pdf_key = str(pdf.resolve())
+        srv._pdf_cache_verified.discard(pdf_key)
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"), \
+                patch("subprocess.run", side_effect=fake_run):
+            result = srv._get_or_cache_pdf_text(pdf)
+
+        assert result == "fresh text"
+        assert txt.is_file()
+        assert (cache_dir / "doc.md5").read_text().strip() == \
+            hashlib.md5(b"new content").hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER file tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestListPerFiles:
+    def test_list_per_empty(self, tmp_path):
+        srv._config["t32_dir"] = str(tmp_path / "nonexistent")
+        result = _j(run(call_tool("list_per_files", {})))
+        assert result["files"] == []
+
+    def test_list_per_finds_files(self, tmp_path):
+        (tmp_path / "demo.per").write_text("; @Title: Demo Peripheral\n")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_per_files", {})))
+        assert result["total"] == 1
+        assert result["files"][0]["name"] == "demo.per"
+        assert result["files"][0]["title"] == "Demo Peripheral"
+
+    def test_list_per_filter(self, tmp_path):
+        (tmp_path / "stm32.per").write_text(";header\n")
+        (tmp_path / "am62x.per").write_text(";header\n")
+        srv._config["t32_dir"] = str(tmp_path)
+        result = _j(run(call_tool("list_per_files", {"filter": "stm"})))
+        assert result["total"] == 1
+        assert result["files"][0]["name"] == "stm32.per"
+
+
+class TestLoadPerFile:
+    def test_load_per_file(self, mock_dbg, tmp_path):
+        per_file = tmp_path / "test.per"
+        per_file.write_text("; peripheral\n")
+        result = _j(run(call_tool("load_per_file", {"file_path": str(per_file)})))
+        assert result["loaded"] is True
+        mock_dbg.cmd.assert_called_once_with(f"PER.Program {per_file}")
+
+    def test_load_per_relative_path(self, mock_dbg, tmp_path):
+        per_dir = tmp_path / "t32"
+        per_dir.mkdir()
+        per_file = per_dir / "soc.per"
+        per_file.write_text("; soc\n")
+        srv._config["t32_dir"] = str(per_dir)
+        result = _j(run(call_tool("load_per_file", {"file_path": "soc.per"})))
+        assert result["loaded"] is True
+
+    def test_load_per_file_not_found(self, mock_dbg):
+        result = _j(run(call_tool("load_per_file", {"file_path": "/no/such/file.per"})))
+        assert result["loaded"] is False
+        assert "not found" in result["error"].lower()
+
+
+class TestPerReadRegister:
+    def test_read_register_long(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\x78\x56\x34\x12"
+        result = _j(run(call_tool("per_read_register", {"address": "0x40021000"})))
+        assert result["value"] == 0x12345678
+        assert result["hex"] == "0x12345678"
+        assert result["access_width"] == "long"
+
+    def test_read_register_byte(self, mock_dbg):
+        mock_dbg.memory.read.return_value = b"\xAB"
+        result = _j(run(call_tool("per_read_register",
+                                   {"address": "0x40021000", "access_width": "byte"})))
+        assert result["value"] == 0xAB
+        mock_dbg.memory.read.assert_called_once()
+        _, kwargs = mock_dbg.memory.read.call_args
+        assert kwargs["length"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Resources
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResources:
+    def test_list_resources_empty(self, tmp_path):
+        srv._config.update(t32_dir=str(tmp_path / "nope"), hints=None)
+        resources = run(srv.list_resources())
+        assert resources == []
+
+    def test_list_resources_with_docs(self, tmp_path):
+        pdf_dir = tmp_path / "pdf"
+        pdf_dir.mkdir()
+        (pdf_dir / "debugger_arm.pdf").write_bytes(b"fake")
+        srv._config.update(t32_dir=str(tmp_path), hints=None)
+        resources = run(srv.list_resources())
+        doc_resources = [r for r in resources
+                         if str(r.uri).startswith("trace32://docs/")]
+        assert len(doc_resources) == 1
+        assert doc_resources[0].name == "debugger_arm.pdf"
+
+    def test_list_resources_with_hints(self, tmp_path):
+        hints = tmp_path / "hints.md"
+        hints.write_text("# My Tips\nSome hint\n")
+        srv._config.update(t32_dir=str(tmp_path / "nope"),
+                           hints=str(hints))
+        resources = run(srv.list_resources())
+        hint_resources = [r for r in resources
+                          if str(r.uri) == "trace32://hints"]
+        assert len(hint_resources) == 1
+
+    def test_read_resource_hints(self, tmp_path):
+        hints = tmp_path / "tips.md"
+        hints.write_text("# Debugging Tips\nTip 1\n")
+        srv._config.update(hints=str(hints))
+        text = run(srv.read_resource("trace32://hints"))
+        assert "Debugging Tips" in text
+
+    def test_read_resource_hints_empty(self):
+        srv._config.update(hints=None)
+        text = run(srv.read_resource("trace32://hints"))
+        assert "No hints" in text
+
+    def test_read_resource_unknown(self):
+        text = run(srv.read_resource("trace32://unknown"))
+        assert "Unknown resource" in text
+
+    def test_read_resource_doc_not_found(self, tmp_path):
+        srv._config["t32_dir"] = str(tmp_path)
+        text = run(srv.read_resource("trace32://docs/missing.pdf"))
+        assert "not found" in text.lower()
+
+
+class TestLoadHints:
+    def test_load_hints_from_dir(self, tmp_path):
+        hdir = tmp_path / "hints"
+        hdir.mkdir()
+        (hdir / "a.md").write_text("# Hint A\n")
+        (hdir / "b.md").write_text("# Hint B\n")
+        (hdir / "ignore.txt").write_text("not loaded")
+        srv._config.update(hints=str(hdir))
+        text = srv._load_hints()
+        assert "Hint A" in text
+        assert "Hint B" in text
+        assert "not loaded" not in text
+
+    def test_load_hints_from_file(self, tmp_path):
+        hf = tmp_path / "tips.md"
+        hf.write_text("# My Tips\n")
+        srv._config.update(hints=str(hf))
+        text = srv._load_hints()
+        assert "My Tips" in text
+
+    def test_load_hints_none(self):
+        srv._config.update(hints=None)
+        assert srv._load_hints() == ""
+
+    def test_load_hints_nonexistent_path(self, tmp_path):
+        srv._config.update(hints=str(tmp_path / "nope"))
+        assert srv._load_hints() == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serve
 # ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -556,7 +1795,8 @@ async def _mock_stdio():
 
 
 class TestServe:
-    def _run_serve(self, host="localhost", port=20000, protocol="TCP", timeout=60.0):
+    def _run_serve(self, host="localhost", port=20000, protocol="TCP",
+                   timeout=60.0):
         async def _inner():
             with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
                  patch("lauterbachdebugger_mcp.server.server") as mock_srv:
@@ -565,43 +1805,150 @@ class TestServe:
                 await serve(host, port, protocol, timeout)
         asyncio.run(_inner())
 
-    def test_auto_connect_calls_t32_with_correct_args(self):
-        mock_conn = MagicMock()
-        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
-            mock_t32.connect.return_value = mock_conn
+    def _run_serve_real_server(self, **kwargs):
+        """Run serve() without replacing the server object.
+
+        Patches only server.run and stdio_server so that serve() can
+        modify server.instructions on the real Server instance.
+        """
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch.object(srv.server, "run", new=AsyncMock()), \
+                 patch.object(srv.server, "create_initialization_options",
+                              return_value={}):
+                await serve("localhost", 20000, "TCP", 60.0, **kwargs)
+        asyncio.run(_inner())
+
+    def test_auto_connect_task_is_created(self):
+        """serve() creates a background auto-connect task."""
+        with patch("lauterbachdebugger_mcp.server.t32"):
             self._run_serve("192.168.0.1", 9000, "UDP", 5.0)
-        mock_t32.connect.assert_called_once_with(
-            node="192.168.0.1", port=9000, protocol="UDP", timeout=5.0
-        )
+        # The task was created (may be done or cancelled by now)
+        assert srv._auto_connect_task is not None
 
-    def test_auto_connect_sets_dbg(self):
+    def test_auto_connect_success_sets_dbg(self):
+        """Successful auto-connect sets the global debugger handle."""
         mock_conn = MagicMock()
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
             mock_t32.connect.return_value = mock_conn
+            # Run _try_auto_connect directly to test the logic
+            asyncio.run(srv._try_auto_connect(
+                "localhost", 20000, "TCP", 60.0))
+        assert srv._dbg is mock_conn
 
-            async def _check():
-                with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
-                     patch("lauterbachdebugger_mcp.server.server") as mock_srv:
-                    mock_srv.run = AsyncMock()
-                    mock_srv.create_initialization_options.return_value = {}
-                    await serve("localhost", 20000, "TCP", 60.0)
-                assert srv._dbg is mock_conn
-
-            asyncio.run(_check())
-
-    def test_failed_auto_connect_does_not_abort_server(self):
-        """ConnectionRefusedError on connect must not prevent the server from starting."""
+    def test_auto_connect_failure_does_not_abort_server(self):
+        """Failed auto-connect logs warning; server keeps running."""
         with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
-            mock_t32.connect.side_effect = ConnectionRefusedError("no TRACE32")
+            mock_t32.connect.side_effect = ConnectionRefusedError("no T32")
             self._run_serve()  # must not raise
         assert srv._dbg is None
 
+    def test_auto_connect_skips_if_already_connected(self):
+        """If user connected via tool before auto-connect finishes, discard."""
+        existing = MagicMock()
+        srv._dbg = existing
+        new_conn = MagicMock()
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = new_conn
+            asyncio.run(srv._try_auto_connect(
+                "localhost", 20000, "TCP", 60.0))
+        # Existing connection preserved, new one disconnected
+        assert srv._dbg is existing
+        new_conn.disconnect.assert_called_once()
+
+    def test_stores_connection_defaults(self):
+        """serve() must store CLI params so the connect tool can use them."""
+        self._run_serve("10.0.0.1", 9999, "UDP", 5.0)
+        assert srv._conn_defaults["host"] == "10.0.0.1"
+        assert srv._conn_defaults["port"] == 9999
+        assert srv._conn_defaults["protocol"] == "UDP"
+        assert srv._conn_defaults["timeout"] == 5.0
+
     def test_stdio_server_run_is_called(self):
-        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32, \
-             patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+        with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
              patch("lauterbachdebugger_mcp.server.server") as mock_srv:
-            mock_t32.connect.return_value = MagicMock()
             mock_srv.run = AsyncMock()
             mock_srv.create_initialization_options.return_value = {}
             asyncio.run(serve("localhost", 20000, "TCP", 60.0))
         mock_srv.run.assert_awaited_once()
+
+    def test_stores_t32_dir_config(self):
+        """serve() must store t32_dir in _config."""
+        self._run_serve()
+        assert srv._config["t32_dir"] == "~/t32"
+
+    def test_stores_custom_t32_dir_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             t32_dir="/custom/t32")
+        asyncio.run(_inner())
+        assert srv._config["t32_dir"] == "/custom/t32"
+
+    def test_stores_hints_config(self):
+        """serve() must store hints in _config."""
+        self._run_serve()
+        assert srv._config["hints"] is None
+
+    def test_stores_hints_file_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             hints="/my/tips.md")
+        asyncio.run(_inner())
+        assert srv._config["hints"] == "/my/tips.md"
+
+    def test_stores_hints_directory_config(self):
+        async def _inner():
+            with patch("lauterbachdebugger_mcp.server.stdio_server", _mock_stdio), \
+                 patch("lauterbachdebugger_mcp.server.server") as mock_srv:
+                mock_srv.run = AsyncMock()
+                mock_srv.create_initialization_options.return_value = {}
+                await serve("localhost", 20000, "TCP", 60.0,
+                             hints="/my/hints-dir")
+        asyncio.run(_inner())
+        assert srv._config["hints"] == "/my/hints-dir"
+
+    def test_hints_embedded_in_instructions(self, tmp_path):
+        hints = tmp_path / "tips.md"
+        hints.write_text("# My Board Tips\nAlways reset before flash.\n")
+        self._run_serve_real_server(hints=str(hints))
+        assert "My Board Tips" in srv.server.instructions
+        assert "Always reset before flash" in srv.server.instructions
+
+    def test_instructions_reset_without_hints(self):
+        """Without hints, serve() resets instructions to the static default."""
+        srv.server.instructions = "modified"
+        self._run_serve_real_server()
+        assert srv.server.instructions == srv.INSTRUCTIONS
+
+    def test_connect_tool_uses_stored_defaults(self):
+        """When connect tool is called with no args, it uses serve() defaults."""
+        srv._conn_defaults.update(host="10.0.0.1", port=9999,
+                                  protocol="UDP", timeout=5.0)
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = MagicMock()
+            run(call_tool("connect", {}))
+        mock_t32.connect.assert_called_once_with(
+            node="10.0.0.1", port="9999", protocol="UDP", timeout=5.0
+        )
+
+    def test_connect_tool_cancels_pending_auto_connect(self):
+        """Explicit connect cancels a pending auto-connect task."""
+        # Simulate a pending (not yet done) auto-connect task
+        pending_task = AsyncMock(spec=asyncio.Task)
+        pending_task.done.return_value = False
+        pending_task.cancel.return_value = True
+        srv._auto_connect_task = pending_task
+
+        with patch("lauterbachdebugger_mcp.server.t32") as mock_t32:
+            mock_t32.connect.return_value = MagicMock()
+            run(call_tool("connect", {}))
+
+        pending_task.cancel.assert_called_once()
