@@ -58,128 +58,53 @@ INSTRUCTIONS = """\
 You are connected to a Lauterbach TRACE32 debugger via its Remote API.
 
 ## Connection
-This server starts WITHOUT an active TRACE32 connection. You MUST call the
-`connect` tool before using any other tool. The connect tool uses defaults
-from the CLI (host/port) when called without arguments.
+The server starts WITHOUT a connection. Call `connect` before any other tool
+(no args uses the CLI host/port defaults).
 
-## Target States
-The target CPU has four states (returned by `get_state`):
-  0 = stopped/down - target is not accessible
-  1 = running - target is executing code
-  2 = halted - target is stopped at a breakpoint or after a step
-  3 = background_running - target is running with background debug access
-
-IMPORTANT: The target MUST be halted (state 2) to read registers, memory,
-variables, or to step. If state is 1 (running), call `break_` first.
+## Target States (`get_state`)
+0=stopped, 1=running, 2=halted, 3=background_running. The target MUST be
+halted (2) to read registers/memory/variables or to step; if running (1),
+call `break_` first.
 
 ## Address Classes
-TRACE32 uses access class prefixes for addresses:
-  D:0x... = Data access
-  P:0x... = Program access
-  Plain 0x... = Default access class
-Use the appropriate prefix when reading/writing memory.
+Prefix addresses with an access class: D:0x... (data), P:0x... (program),
+or plain 0x... (default). Use the right prefix when reading/writing memory.
 
 ## Debug Symbols
-Debug symbols must be loaded in TRACE32 for variable/symbol queries to work.
-Load symbols with: run_command("Data.LOAD.ELF <file>") or via a CMM script.
+Variable/symbol queries need symbols loaded:
+run_command("Data.LOAD.ELF <file>").
 
-## Common Workflows
-
-### Halt-Inspect-Resume
-1. get_state - check if running
-2. break_ - halt if running
-3. Inspect: read registers, memory, variables, get_context, backtrace
-4. go - resume execution
-
-### After Any Step/Break
-Execution control tools (step, break_, step_over, etc.) automatically
-return PC and, when debug symbols are loaded, function name, source
-file, and source line.  No separate call is needed for basic
-situational awareness.  Use `get_context` only when you need the
-full snapshot (SP, LR, CPU name, etc.).
-
-### Enriched Responses
-- Breakpoint tools include symbol resolution (function, source location)
-  at the breakpoint address.
-- `read_memory` includes an `ascii` field alongside hex and bytes.
-
-### Set Breakpoint by Name
-Use `set_breakpoint_at_symbol` with a function name like "main".
-
-### Read C Strings
-Use `read_string` tool with the string address.
+## Enriched Responses
+- Execution tools (step, break_, step_over, ...) already return PC and, when
+  symbols are loaded, function/source file/line. Use `get_context` only for
+  the full snapshot (SP, LR, CPU name).
+- Breakpoint tools include symbol resolution at the breakpoint address.
+- `read_memory` includes an `ascii` field alongside `hex`.
 
 ## Composite / High-Level Tools
-
-These tools combine multiple TRACE32 operations into a single call, reducing
-round-trips and applying graceful degradation (partial data is returned even
-when a sub-operation fails).  Prefer them over assembling equivalent results
-from several primitive tools.
-
-### Situational Awareness
-- `get_context` - Full CPU snapshot in one call: state, PC, SP, LR, current
-  function name, source file, source line, and CPU name.  Use at any halt to
-  understand where execution stopped without issuing four separate register and
-  symbol queries.
-- `get_source_location` - Source file and line for a given address (defaults
-  to current PC).  Faster than manually chaining sYmbol.SOURCEFILE and
-  sYmbol.SOURCELINE via evaluate_function.
-- `backtrace` - Walk the entire call stack with function name and source
-  resolution per frame.  Use after a crash or unexpected halt to trace how
-  execution arrived at the current point.
-- `snapshot` - One-shot: context + backtrace + breakpoint list + system_info.
-  Use as the first action when investigating an unknown failure; a single call
-  captures everything needed to describe the program state.
-
-### Execution Flow
-- `run_until` - Run to an address or symbol, then halt.  Sets a temporary
-  breakpoint, resumes execution, and polls until halted or timeout expires.
-  Avoids the manual sequence of set_breakpoint + go + polling loop.
-- `set_breakpoint_at_symbol` - Set a breakpoint by function or label name
-  without a preceding address lookup.  One call instead of
-  query_symbol_by_name + set_breakpoint.
-
-### Memory and Data
-- `read_string` - Read a null-terminated C string from a memory address.
-  Use for char* variables without manually issuing repeated read_memory calls
-  to find the null terminator.
-- `dump_memory_formatted` - Hex + ASCII dump (like hexdump -C).  Output is
-  immediately readable without post-processing raw byte arrays.
-- `write_memory` - Write raw bytes expressed as a hex string to target memory.
-- `search_memory` - Scan a memory range for a byte pattern in chunks.
-  Useful for locating magic constants, stack canaries, or signs of corruption.
-
-### Code Inspection
-- `disassemble` - Read raw instruction bytes at an address (defaults to PC).
-  Returns hex bytes per instruction-sized chunk.  TRACE32 PRACTICE does not
-  expose a disassembly text function via its remote API; use the CPU type
-  returned to decode the hex bytes.
-- `evaluate_expression` - Evaluate a C/C++ expression and return value, type,
-  and hex representation.  Understands struct field access, pointer
-  dereferences, and type casts without requiring PRACTICE syntax knowledge.
-
-### System and Symbol Browsing
-- `get_system_info` - CPU name, family, and endianness in one call.
-  Use at session start to orient the LLM to the target.
-- `list_functions` - Count symbols matching a wildcard filter via
-  sYmbol.COUNT().  TRACE32 PRACTICE has no indexed symbol iterator; this
-  tool reports the match count and advises using query_symbol_by_name for
-  individual lookups.
-- `list_global_variables` - Same as list_functions but documents intent as
-  variable lookup.  Use query_symbol_by_name to fetch a specific variable.
+Prefer these; each combines several TRACE32 operations in one call and
+degrades gracefully (partial data on sub-failure).
+- `get_context` - state, PC, SP, LR, function, source, CPU in one call.
+- `get_source_location` - source file/line for an address (default PC).
+- `backtrace` - walk the call stack with per-frame symbol resolution.
+- `snapshot` - context + backtrace + breakpoints + system info in one call.
+- `run_until` - run to an address/symbol via a temporary breakpoint.
+- `set_breakpoint_at_symbol` - breakpoint by function/label name (e.g. "main").
+- `read_string` - read a null-terminated C string.
+- `dump_memory_formatted` - hex + ASCII dump (like hexdump -C).
+- `write_memory` - write raw bytes given as a hex string.
+- `search_memory` - scan a range for a byte pattern.
+- `disassemble` - raw instruction bytes at an address (T32's remote API has
+  no disassembly-text function; decode using the returned CPU type).
+- `evaluate_expression` - evaluate a C/C++ expression (value, type, hex).
+- `get_system_info` - CPU name, family, endianness.
+- `list_functions` / `list_global_variables` - count matches via
+  sYmbol.COUNT(); use query_symbol_by_name for individual lookups.
 
 ## Useful PRACTICE Functions (for evaluate_function)
-  Register(PC) - read PC register
-  STATE.RUN() - check if target is running (TRUE/FALSE)
-  sYmbol.FUNCTION(addr) - function name at address
-  sYmbol.SOURCEFILE(addr) - source file at address
-  sYmbol.SOURCELINE(addr) - source line at address
-  Var.VALUE(expr) - evaluate C expression
-  Data.STRing(D:addr) - read null-terminated string
-  CPU() - current CPU name
-  CPUFAMILY() - CPU family name
-  SYSTEM.BIGENDIAN() - TRUE if big-endian target
-
+Register(PC); STATE.RUN(); sYmbol.FUNCTION(addr); sYmbol.SOURCEFILE(addr);
+sYmbol.SOURCELINE(addr); Var.VALUE(expr); Data.STRing(D:addr); CPU();
+CPUFAMILY(); SYSTEM.BIGENDIAN().
 """
 
 
@@ -1589,11 +1514,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             addr = dbg.address.from_string(arguments["address"])
             data = dbg.memory.read(addr, length=int(arguments["length"]))
             ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+            # Only hex + ascii are returned; a decimal `bytes` list would
+            # roughly triple the token cost while duplicating `hex`.
             return _ok({
                 "address": arguments["address"],
                 "length": len(data),
                 "hex": data.hex(),
-                "bytes": list(data),
                 "ascii": ascii_repr,
             })
 
@@ -1874,11 +1800,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             except ValueError:
                 base = 0
             dump = _format_hex_dump(data, base)
+            # `dump` already contains the hex bytes; a separate `raw_hex`
+            # field would duplicate that data and double the token cost.
             return _ok({
                 "address": addr_str,
                 "length": len(data),
                 "dump": dump,
-                "raw_hex": data.hex(),
             })
 
         elif name == "write_memory":
@@ -2225,12 +2152,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             addr = dbg.address.from_string(address)
             data = dbg.memory.read(addr, length=nbytes)
             value = int.from_bytes(data, "little")
+            # `value`/`hex` already convey the register contents; a separate
+            # `raw_bytes` field would be redundant.
             return _ok({
                 "address": address,
                 "access_width": width,
                 "value": value,
                 "hex": hex(value),
-                "raw_bytes": data.hex(),
             })
 
         else:

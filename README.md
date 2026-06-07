@@ -301,7 +301,7 @@ Run a CMM script file (blocking).
 ### Memory
 
 #### `read_memory`
-Read raw bytes. Returns `{ address, length, hex, bytes[], ascii }`.
+Read raw bytes. Returns `{ address, length, hex, ascii }`.
 
 | Parameter | Type | Description |
 |---|---|---|
