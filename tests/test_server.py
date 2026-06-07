@@ -622,12 +622,14 @@ class TestPracticeTools:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMemoryTools:
-    def test_read_memory_returns_hex_bytes_and_ascii(self, mock_dbg):
+    def test_read_memory_returns_hex_and_ascii(self, mock_dbg):
         mock_dbg.memory.read.return_value = bytes([0xDE, 0xAD, 0x42, 0xEF])
         data = json.loads(run(call_tool("read_memory", {"address": "0x20000000", "length": 4}))[0].text)
         assert data["hex"] == "dead42ef"
         assert data["length"] == 4
-        assert data["bytes"] == [0xDE, 0xAD, 0x42, 0xEF]
+        # A decimal `bytes` list is intentionally omitted to save tokens;
+        # `hex` carries the same data more compactly.
+        assert "bytes" not in data
         assert data["ascii"] == "..B."  # 0xDE, 0xAD non-printable; 0x42='B'; 0xEF non-printable
 
     @pytest.mark.parametrize("dtype,method", [
@@ -1139,7 +1141,9 @@ class TestDumpMemoryFormatted:
         }))[0].text)
         assert data["length"] == 32
         assert "00001000" in data["dump"]
-        assert data["raw_hex"] == bytes(range(32)).hex()
+        # `raw_hex` is intentionally omitted to save tokens; the hex bytes
+        # are already present in `dump`.
+        assert "raw_hex" not in data
 
 
 class TestWriteMemory:
