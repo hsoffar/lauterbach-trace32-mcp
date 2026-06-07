@@ -350,10 +350,12 @@ Write a value to a register.
 | `type` | string | `PROGRAM` | `PROGRAM` `READ` `WRITE` `RW` |
 | `impl` | string | `AUTO` | `AUTO` `SOFT` `ONCHIP` `HARD` `MARK` |
 | `size` | integer | — | Size in bytes (optional) |
-| `core` | integer | — | Core (optional) |
+| `core` | integer | — | Core (optional, ignored for conditional breakpoints) |
 | `enabled` | boolean | `true` | Whether enabled |
+| `condition` | string | — | Optional HLL/C boolean condition; target halts only when it is true, e.g. `i == 5` |
 
 Returns enriched response with symbol resolution at the breakpoint address.
+When a `condition` is given, the breakpoint is set via `Break.Set <addr> /<type> /<impl> /VarCONDition <condition>` (the RCL `breakpoint.set()` API has no condition parameter).
 
 #### `list_breakpoints`
 Returns a list of all currently set breakpoints with symbol info.

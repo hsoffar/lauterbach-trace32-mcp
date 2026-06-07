@@ -605,12 +605,20 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "core": {
                         "type": "integer",
-                        "description": "Target core (optional).",
+                        "description": "Target core (optional, ignored for conditional breakpoints).",
                     },
                     "enabled": {
                         "type": "boolean",
                         "description": "Whether the breakpoint is enabled. Default: true",
                         "default": True,
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": (
+                            "Optional HLL/C boolean condition; the target halts only "
+                            "when it evaluates true, e.g. 'i == 5' or 'flags[3] != 0'. "
+                            "Sets a conditional breakpoint via Break.Set /VarCONDition."
+                        ),
                     },
                 },
                 "required": ["address"],
@@ -1596,22 +1604,61 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         # ── Breakpoints ───────────────────────────────────────────────────
         elif name == "set_breakpoint":
             dbg = _require_connection()
-            addr = dbg.address.from_string(arguments["address"])
+            addr_str = arguments["address"]
+            bp_type = arguments.get("type", "PROGRAM")
+            bp_impl = arguments.get("impl", "AUTO")
+            condition = arguments.get("condition")
+
+            if condition:
+                # RCL's breakpoint.set() API exposes no condition parameter,
+                # so a conditional breakpoint must be set via the PRACTICE
+                # Break.Set command with the /VarCONDition option.
+                target = addr_str
+                size = arguments.get("size")
+                if size:
+                    # Express the size as an address range when the numeric
+                    # part is parseable, preserving any access-class prefix.
+                    cls, _, num = addr_str.rpartition(":")
+                    try:
+                        end = hex(int(num, 0) + int(size) - 1)
+                        target = f"{addr_str}--{(cls + ':' if cls else '')}{end}"
+                    except ValueError:
+                        target = addr_str
+                dbg.cmd(
+                    f"Break.Set {target} /{bp_type} /{bp_impl} "
+                    f"/VarCONDition {condition}"
+                )
+                if not arguments.get("enabled", True):
+                    try:
+                        dbg.cmd(f"Break.DISable {addr_str}")
+                    except Exception:
+                        pass
+                bp_info: dict[str, Any] = {
+                    "address": addr_str,
+                    "type": bp_type,
+                    "impl": bp_impl,
+                    "condition": condition,
+                    "enabled": arguments.get("enabled", True),
+                }
+                bp_info.update(_resolve_symbol_at(dbg, addr_str))
+                return _ok(bp_info)
+
+            addr = dbg.address.from_string(addr_str)
             bp = dbg.breakpoint.set(
                 address=addr,
-                type_=Breakpoint.Type[arguments.get("type", "PROGRAM")],
-                impl=Breakpoint.Impl[arguments.get("impl", "AUTO")],
+                type_=Breakpoint.Type[bp_type],
+                impl=Breakpoint.Impl[bp_impl],
                 size=arguments.get("size"),
                 core=arguments.get("core"),
                 enabled=arguments.get("enabled", True),
             )
-            bp_info: dict[str, Any] = {
+            bp_info = {
                 "breakpoint": str(bp),
-                "address": arguments["address"],
-                "type": arguments.get("type", "PROGRAM"),
-                "impl": arguments.get("impl", "AUTO"),
+                "address": addr_str,
+                "type": bp_type,
+                "impl": bp_impl,
             }
-            bp_info.update(_resolve_symbol_at(dbg, arguments["address"]))
+            bp_info.update(_resolve_symbol_at(dbg, addr_str))
             return _ok(bp_info)
 
         elif name == "list_breakpoints":

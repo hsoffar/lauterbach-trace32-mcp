@@ -728,6 +728,53 @@ class TestBreakpointTools:
         assert data["type"] == "PROGRAM"
         assert data["impl"] == "AUTO"
 
+    def test_set_conditional_breakpoint_uses_break_set_command(self, mock_dbg):
+        mock_dbg.fnc.return_value = "main"
+        data = json.loads(run(call_tool("set_breakpoint", {
+            "address": "0x08000100", "condition": "i == 5"
+        }))[0].text)
+        # Conditional breakpoints go through the PRACTICE command, not the
+        # RCL breakpoint.set() API.
+        mock_dbg.cmd.assert_called_once_with(
+            "Break.Set 0x08000100 /PROGRAM /AUTO /VarCONDition i == 5"
+        )
+        assert not mock_dbg.breakpoint.set.called
+        assert data["condition"] == "i == 5"
+        assert data["address"] == "0x08000100"
+        assert data["type"] == "PROGRAM"
+        assert "breakpoint" not in data  # command path returns no handle string
+
+    def test_set_conditional_breakpoint_with_size_uses_range(self, mock_dbg):
+        mock_dbg.fnc.return_value = None
+        run(call_tool("set_breakpoint", {
+            "address": "D:0x2000", "type": "WRITE", "impl": "ONCHIP",
+            "size": 4, "condition": "x > 0"
+        }))
+        mock_dbg.cmd.assert_called_once_with(
+            "Break.Set D:0x2000--D:0x2003 /WRITE /ONCHIP /VarCONDition x > 0"
+        )
+
+    def test_set_conditional_breakpoint_disabled(self, mock_dbg):
+        mock_dbg.fnc.return_value = None
+        data = json.loads(run(call_tool("set_breakpoint", {
+            "address": "0x1000", "condition": "i == 5", "enabled": False
+        }))[0].text)
+        calls = [c.args[0] for c in mock_dbg.cmd.call_args_list]
+        assert "Break.Set 0x1000 /PROGRAM /AUTO /VarCONDition i == 5" in calls
+        assert "Break.DISable 0x1000" in calls
+        assert data["enabled"] is False
+
+    def test_set_breakpoint_without_condition_uses_api(self, mock_dbg):
+        mock_dbg.breakpoint.set.return_value = MagicMock(__str__=lambda s: "BP@0x1000")
+        mock_dbg.fnc.return_value = "main"
+        data = json.loads(run(call_tool("set_breakpoint", {
+            "address": "0x08000100"
+        }))[0].text)
+        assert mock_dbg.breakpoint.set.called
+        assert not mock_dbg.cmd.called
+        assert data["breakpoint"] == "BP@0x1000"
+        assert "condition" not in data
+
     def test_list_breakpoints_returns_enriched_list(self, mock_dbg):
         bp_mocks = []
         for i in range(3):
