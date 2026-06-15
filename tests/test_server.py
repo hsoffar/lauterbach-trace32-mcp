@@ -1303,6 +1303,27 @@ class TestSetBreakpointAtSymbol:
         mock_dbg.cmd.assert_called_once_with("Break.Set foo /WRITE /ONCHIP")
         assert data["address"] is None
 
+    def test_conditional_breakpoint_at_symbol(self, mock_dbg):
+        sym = MagicMock()
+        sym.address = MagicMock(__str__=lambda s: "0x1000")
+        mock_dbg.symbol.query_by_name.return_value = sym
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "main", "condition": "arg == 5"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with(
+            "Break.Set main /PROGRAM /AUTO /VarCONDition arg == 5"
+        )
+        assert data["condition"] == "arg == 5"
+        assert data["symbol"] == "main"
+
+    def test_no_condition_omits_varcondition(self, mock_dbg):
+        mock_dbg.symbol.query_by_name.side_effect = RuntimeError("no sym")
+        data = json.loads(run(call_tool("set_breakpoint_at_symbol", {
+            "symbol": "main"
+        }))[0].text)
+        mock_dbg.cmd.assert_called_once_with("Break.Set main /PROGRAM /AUTO")
+        assert "condition" not in data
+
     def test_symbol_not_found_suggests_loading_elf(self, mock_dbg):
         # T32CommandError is the real exception type raised by the T32 API
         from lauterbachdebugger_mcp.server import T32CommandError

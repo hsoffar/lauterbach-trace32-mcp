@@ -439,7 +439,9 @@ Disassemble instructions at an address (defaults to PC). Optional `count`
 (default 10).
 
 #### `set_breakpoint_at_symbol`
-Set a breakpoint by function or label name (e.g. `main`).
+Set a breakpoint by function or label name (e.g. `main`). Accepts an optional
+`condition` (HLL/C boolean expression, e.g. `arg == 5`) to set a conditional
+breakpoint via `Break.Set <symbol> /<type> /<impl> /VarCONDition <condition>`.
 
 #### `run_until`
 Run to an address or symbol with timeout. Uses temporary breakpoint.

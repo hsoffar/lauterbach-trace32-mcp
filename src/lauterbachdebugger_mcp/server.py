@@ -919,6 +919,14 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Breakpoint implementation. Default: AUTO",
                         "default": "AUTO",
                     },
+                    "condition": {
+                        "type": "string",
+                        "description": (
+                            "Optional HLL/C boolean condition; the target halts only "
+                            "when it evaluates true at the symbol, e.g. 'arg == 5'. "
+                            "Sets a conditional breakpoint via Break.Set /VarCONDition."
+                        ),
+                    },
                 },
                 "required": ["symbol"],
             },
@@ -1965,13 +1973,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             symbol = arguments["symbol"]
             bp_type = arguments.get("type", "PROGRAM")
             bp_impl = arguments.get("impl", "AUTO")
-            dbg.cmd(f"Break.Set {symbol} /{bp_type} /{bp_impl}")
+            condition = arguments.get("condition")
+            cmd = f"Break.Set {symbol} /{bp_type} /{bp_impl}"
+            if condition:
+                # Halt only when the HLL/C condition is true at the symbol.
+                cmd += f" /VarCONDition {condition}"
+            dbg.cmd(cmd)
             result = {
                 "symbol": symbol,
                 "type": bp_type,
                 "impl": bp_impl,
                 "enabled": True,
             }
+            if condition:
+                result["condition"] = condition
             try:
                 sym = dbg.symbol.query_by_name(symbol)
                 result["address"] = str(sym.address) if sym.address else None
